@@ -1,0 +1,443 @@
+# ARCHITECTURE.md — GitHub Repo Analyzer
+## Ports & Adapters (Hexagonal) Architecture
+
+---
+
+## 1. Philosophy
+
+This system is built on the **Hexagonal Architecture** (Ports & Adapters) pattern, coined by Alistair Cockburn. The core idea: **your business logic should not know or care about the outside world** — databases, HTTP, GitHub APIs, or MCP transports are all external concerns wired in from the outside.
+
+```
+         ┌──────────────────────────────────────────────────────────────────┐
+         │                        OUTSIDE WORLD                            │
+         │                                                                  │
+         │  [HTTP Client]   [MCP Client]   [GitHub API]   [PostgreSQL]     │
+         └─────┬──────────────┬────────────────┬────────────────┬──────────┘
+               │              │                │                │
+         ┌─────▼──────────────▼────┐    ┌──────▼────────────────▼──────────┐
+         │   DRIVING ADAPTERS       │    │      DRIVEN ADAPTERS              │
+         │  (trigger the app)       │    │  (app triggers these)             │
+         │                          │    │                                    │
+         │  ┌─────────────────┐     │    │  ┌────────────────────────────┐   │
+         │  │  Express HTTP   │     │    │  │  GithubAdapter             │   │
+         │  │  /repos/:o/:r   │     │    │  │  implements RepoApiPort     │   │
+         │  │  /trending/:l   │     │    │  └────────────────────────────┘   │
+         │  └─────────────────┘     │    │                                    │
+         │                          │    │  ┌────────────────────────────┐   │
+         │  ┌─────────────────┐     │    │  │  PrismaAdapter             │   │
+         │  │  MCP Server     │     │    │  │  implements MetricsRepoPort│   │
+         │  │  analyze_repo   │     │    │  └────────────────────────────┘   │
+         │  │  get_trending   │     │    │                                    │
+         │  └─────────────────┘     │    └────────────────────────────────────┘
+         └──────────┬───────────────┘                    ▲
+                    │                                     │
+         ┌──────────▼─────────────────────────────────────────────────────┐
+         │                         HEXAGON (Domain)                        │
+         │                                                                  │
+         │   ┌────────────────────────┐   ┌────────────────────────────┐   │
+         │   │     USE CASES           │   │       PORTS                │   │
+         │   │                         │   │  (interfaces only)         │   │
+         │   │  AnalyzeRepo            │──▶│  RepoApiPort               │   │
+         │   │    .execute(o,r,deep)   │   │    getRepo()               │   │
+         │   │                         │   │    getLanguages()          │   │
+         │   │  GetTrending            │──▶│    getIssues()             │   │
+         │   │    .execute(lang?)      │   │                            │   │
+         │   └────────────────────────┘   │  MetricsRepoPort           │   │
+         │                                 │    saveMetrics()           │   │
+         │   ┌────────────────────────┐   │    getMetrics()            │   │
+         │   │     ENTITIES            │   │    getTrending()           │   │
+         │   │                         │   └────────────────────────────┘   │
+         │   │  Repo                   │                                     │
+         │   │  Metrics                │                                     │
+         │   │  TrendingRepo           │                                     │
+         │   └────────────────────────┘                                     │
+         └────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. Layer Definitions
+
+### 2.1 Domain Layer (`src/domain/`)
+
+The **innermost layer**. Zero dependencies on Node.js, Prisma, Octokit, or Express. Contains only:
+
+| Sub-layer | Contents | Rule |
+|-----------|----------|------|
+| `entities/` | `Repo.ts`, `Metrics.ts`, `TrendingRepo.ts` | Pure TypeScript interfaces/classes, no imports from outside domain |
+| `usecases/` | `AnalyzeRepo.ts`, `GetTrending.ts` | Depend on Port interfaces only — never on concrete adapters |
+
+**Entity definitions:**
+
+```typescript
+// domain/entities/Repo.ts
+export interface Repo {
+  owner: string;
+  name: string;
+  fullName: string;
+  description: string | null;
+  stars: number;
+  forks: number;
+  openIssues: number;
+  defaultBranch: string;
+  pushedAt: Date;
+  createdAt: Date;
+}
+
+// domain/entities/Metrics.ts
+export interface Metrics {
+  repoOwner: string;
+  repoName: string;
+  stars: number;
+  starGrowth24h: string;        // e.g. "+142 (0.8%)"
+  languages: Record<string, number>;
+  openIssues: number;
+  contributors: number;
+  lastCommit: Date;
+  analyzedAt: Date;
+}
+
+// domain/entities/TrendingRepo.ts
+export interface TrendingRepo {
+  owner: string;
+  name: string;
+  stars: number;
+  starGrowth24h: string;
+  primaryLanguage: string | null;
+  description: string | null;
+}
+```
+
+**Use Case: AnalyzeRepo** — core orchestration:
+
+```
+analyzeRepo(owner, repo, deep)
+  │
+  ├── 1. repoApiPort.getRepo(owner, repo)          → fetch live data from GitHub
+  ├── 2. repoApiPort.getLanguages(owner, repo)     → language breakdown
+  ├── 3. [if deep] repoApiPort.getIssues(...)      → issue count verification
+  ├── 4. metricsRepoPort.getMetrics(owner, repo)   → load previous snapshot
+  ├── 5. compute starGrowth24h from delta
+  ├── 6. metricsRepoPort.saveMetrics(computed)     → persist / update cache
+  └── 7. return Metrics
+```
+
+---
+
+### 2.2 Ports Layer (`src/ports/`)
+
+**Contracts (interfaces only)** — no implementation code. These are the "holes" in the hexagon.
+
+```typescript
+// ports/RepoApiPort.ts
+export interface RepoApiPort {
+  getRepo(owner: string, repo: string): Promise<Repo>;
+  getLanguages(owner: string, repo: string): Promise<Record<string, number>>;
+  getIssues(owner: string, repo: string): Promise<number>;
+}
+
+// ports/MetricsRepoPort.ts
+export interface MetricsRepoPort {
+  saveMetrics(data: Metrics): Promise<void>;
+  getMetrics(owner: string, repo: string): Promise<Metrics | null>;
+  getTrending(language?: string): Promise<TrendingRepo[]>;
+}
+```
+
+---
+
+### 2.3 Adapters Layer (`src/adapters/`)
+
+**Concrete implementations** of ports. Can be swapped without touching domain code.
+
+#### GithubAdapter (`adapters/github/GithubAdapter.ts`)
+
+```
+GithubAdapter
+  implements RepoApiPort
+  uses: @octokit/rest
+  env: GITHUB_TOKEN (via constructor injection)
+
+  getRepo()        → GET /repos/{owner}/{repo}
+  getLanguages()   → GET /repos/{owner}/{repo}/languages
+  getIssues()      → GET /repos/{owner}/{repo}/issues?state=open&per_page=1
+                     (reads X-Total-Count or pagination hint)
+```
+
+Rate limiting: Octokit auto-handles 403/429 with retry. Authenticated = 5000 req/hr.
+
+#### PrismaAdapter (`adapters/database/PrismaAdapter.ts`)
+
+```
+PrismaAdapter
+  implements MetricsRepoPort
+  uses: @prisma/client
+  env: DATABASE_URL
+
+  saveMetrics()    → upsert on (repoOwner, repoName)
+  getMetrics()     → findUnique by composite key
+  getTrending()    → findMany WHERE analyzedAt > now-24h
+                     ORDER BY starGrowth DESC
+                     optional WHERE primaryLanguage = lang
+```
+
+---
+
+### 2.4 Server Layer (`src/server/`)
+
+**Driving adapters** — they receive input and call use cases.
+
+#### Express (`server/express.ts`)
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Express App (port 3005)                             │
+│                                                      │
+│  GET  /health                                        │
+│       → { status: "ok", ts: ISO8601 }               │
+│                                                      │
+│  POST /repos/:owner/:repo/analyze                    │
+│       body: { deep?: boolean }                       │
+│       → AnalyzeRepo.execute(owner, repo, deep)       │
+│       ← Metrics (JSON)                              │
+│                                                      │
+│  GET  /repos/:owner/:repo                            │
+│       → MetricsRepoPort.getMetrics(owner, repo)     │
+│       ← Metrics | 404                               │
+│                                                      │
+│  GET  /trending/:language?                           │
+│       → GetTrending.execute(language?)              │
+│       ← TrendingRepo[]                              │
+└──────────────────────────────────────────────────────┘
+```
+
+Error handling: Global error middleware maps domain errors → HTTP status codes.
+
+#### MCP Server (`server/mcp.ts`)
+
+```
+┌──────────────────────────────────────────────────────┐
+│  MCP Server (stdio transport)                        │
+│  SDK: @modelcontextprotocol/typescript-sdk           │
+│                                                      │
+│  Tool: analyze_repo                                  │
+│    input: { owner: string, repo: string,            │
+│             deep?: boolean }                         │
+│    calls: AnalyzeRepo.execute(...)                  │
+│    returns: Metrics as JSON text                    │
+│                                                      │
+│  Tool: get_trending                                  │
+│    input: { language?: string }                     │
+│    calls: GetTrending.execute(...)                  │
+│    returns: TrendingRepo[] as JSON text             │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Data Flow Diagrams
+
+### 3.1 POST /repos/:owner/:repo/analyze
+
+```
+HTTP Client
+    │
+    ▼
+Express Router
+    │  (owner, repo, deep)
+    ▼
+AnalyzeRepo.execute()
+    │
+    ├──▶ GithubAdapter.getRepo()
+    │         │
+    │         ▼ Octokit → GitHub REST API
+    │         ◀ Repo data
+    │
+    ├──▶ GithubAdapter.getLanguages()
+    │         │
+    │         ▼ Octokit → GitHub REST API
+    │         ◀ { TypeScript: 45000, ... }
+    │
+    ├──▶ PrismaAdapter.getMetrics()      ← load previous snapshot
+    │         │
+    │         ▼ Prisma → PostgreSQL
+    │         ◀ Metrics | null
+    │
+    │   [compute growth delta]
+    │
+    ├──▶ PrismaAdapter.saveMetrics()     ← upsert cache
+    │         │
+    │         ▼ Prisma → PostgreSQL
+    │
+    ◀ Metrics (JSON)
+    │
+    ▼
+HTTP 200 { stars, starGrowth24h, languages, ... }
+```
+
+### 3.2 Dependency Injection (Wiring at startup)
+
+```typescript
+// src/index.ts
+const githubAdapter    = new GithubAdapter(process.env.GITHUB_TOKEN);
+const prismaAdapter    = new PrismaAdapter(prismaClient);
+
+const analyzeRepo      = new AnalyzeRepo(githubAdapter, prismaAdapter);
+const getTrending      = new GetTrending(prismaAdapter);
+
+const expressApp       = createExpressApp(analyzeRepo, getTrending, prismaAdapter);
+const mcpServer        = createMcpServer(analyzeRepo, getTrending);
+```
+
+**The domain never imports adapters. Adapters never import each other.**
+
+---
+
+## 4. Database Schema
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Table: repos                                        │
+│  ─────────────────────────────────────────────────── │
+│  id           String   @id @default(cuid())          │
+│  owner        String                                 │
+│  name         String                                 │
+│  fullName     String   @unique                       │
+│  description  String?                                │
+│  stars        Int                                    │
+│  forks        Int                                    │
+│  createdAt    DateTime @default(now())               │
+│  updatedAt    DateTime @updatedAt                    │
+│                                                      │
+│  @@unique([owner, name])                             │
+└──────────────────────────────────────────────────────┘
+           │  1
+           │
+           │  1
+┌──────────────────────────────────────────────────────┐
+│  Table: metrics                                      │
+│  ─────────────────────────────────────────────────── │
+│  id            String   @id @default(cuid())         │
+│  repoOwner     String                                │
+│  repoName      String                                │
+│  stars         Int                                   │
+│  starGrowth24h String                                │
+│  languages     Json                                  │
+│  openIssues    Int                                   │
+│  contributors  Int                                   │
+│  lastCommit    DateTime                              │
+│  analyzedAt    DateTime @default(now())              │
+│                                                      │
+│  @@unique([repoOwner, repoName])                     │
+│  @@index([analyzedAt])                               │
+│  @@index([repoOwner, repoName])                      │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. Dependency Graph
+
+```
+index.ts
+  ├── server/express.ts
+  │     └── domain/usecases/{AnalyzeRepo, GetTrending}
+  ├── server/mcp.ts
+  │     └── domain/usecases/{AnalyzeRepo, GetTrending}
+  ├── adapters/github/GithubAdapter.ts
+  │     └── ports/RepoApiPort.ts   ← interface only
+  └── adapters/database/PrismaAdapter.ts
+        └── ports/MetricsRepoPort.ts  ← interface only
+
+domain/usecases/AnalyzeRepo.ts
+  ├── ports/RepoApiPort.ts     ← depends on interface, NOT GithubAdapter
+  ├── ports/MetricsRepoPort.ts ← depends on interface, NOT PrismaAdapter
+  └── domain/entities/Metrics.ts
+
+domain/usecases/GetTrending.ts
+  ├── ports/MetricsRepoPort.ts
+  └── domain/entities/TrendingRepo.ts
+```
+
+**Dependency rule: arrows point inward. Domain knows nothing outside itself.**
+
+---
+
+## 6. Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GITHUB_TOKEN` | ✅ | Personal Access Token, classic or fine-grained (public_repo read) |
+| `DATABASE_URL` | ✅ | `postgresql://user:pass@localhost:5432/analyzer` |
+| `PORT` | optional | HTTP port (default 3005) |
+| `NODE_ENV` | optional | `development` / `production` |
+
+---
+
+## 7. Docker Topology
+
+```
+docker-compose.yml
+  │
+  ├── service: postgres
+  │     image: postgres:16-alpine
+  │     port:  5432:5432
+  │     volume: pgdata:/var/lib/postgresql/data
+  │     env:   POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+  │
+  └── (app runs on host / separate container — your choice)
+        connects to: DATABASE_URL=postgresql://...@localhost:5432/analyzer
+```
+
+---
+
+## 8. Testing Strategy
+
+Each layer is independently testable:
+
+| Layer | Test Type | Approach |
+|-------|-----------|----------|
+| Domain entities | Unit | Pure TypeScript, no mocks needed |
+| Use cases | Unit | Inject mock ports (jest.fn() / vi.fn()) |
+| Adapters | Integration | Use real GitHub sandbox / local Postgres |
+| HTTP endpoints | Integration | Supertest against real Express instance |
+| MCP tools | Integration | MCP SDK in-process test client |
+
+**Example use case test:**
+```typescript
+const mockRepoApi: RepoApiPort = {
+  getRepo: jest.fn().mockResolvedValue(fakeRepo),
+  getLanguages: jest.fn().mockResolvedValue({ TypeScript: 50000 }),
+  getIssues: jest.fn().mockResolvedValue(12),
+};
+const mockMetricsRepo: MetricsRepoPort = {
+  saveMetrics: jest.fn(),
+  getMetrics: jest.fn().mockResolvedValue(null),
+  getTrending: jest.fn(),
+};
+
+const useCase = new AnalyzeRepo(mockRepoApi, mockMetricsRepo);
+const result = await useCase.execute("facebook", "react", false);
+
+expect(result.stars).toBe(fakeRepo.stars);
+expect(mockMetricsRepo.saveMetrics).toHaveBeenCalledOnce();
+```
+
+---
+
+## 9. Key Architectural Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| HTTP framework | Express | Minimal overhead, ecosystem familiarity, easy middleware |
+| ORM | Prisma | Type-safe queries, auto-generated client, migration tooling |
+| GitHub client | Octokit | Official, handles auth, rate limits, pagination |
+| MCP transport | stdio | Standard for local MCP servers, compatible with Claude Desktop |
+| Caching strategy | DB upsert (last-write-wins) | Simple, queryable, 24h growth calculation built in |
+| Dependency injection | Constructor injection | Explicit, testable, no DI container overhead needed at this scale |
+| Port style | TypeScript interfaces | Zero runtime cost, pure contracts |
+
+---
+
+*Architecture version: 1.0 — MVP scope*
+
