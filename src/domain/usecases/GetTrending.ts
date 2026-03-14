@@ -13,6 +13,6 @@ export class GetTrending {
    * Implementation in Phase 5.
    */
   async execute(language?: string): Promise<TrendingRepo[]> {
-    throw new Error("not implemented");
+    return this.metricsRepoPort.getTrending(language);
   }
 }

@@ -1,1 +1,39 @@
-// Placeholder — full schema in Phase 4
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Repo {
+  id          String   @id @default(cuid())
+  owner       String
+  name        String
+  fullName    String   @unique
+  description String?
+  stars       Int
+  forks       Int
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([owner, name])
+}
+
+model Metrics {
+  id            String   @id @default(cuid())
+  repoOwner     String
+  repoName      String
+  stars         Int
+  starGrowth24h String
+  languages     Json
+  openIssues    Int
+  contributors  Int
+  lastCommit    DateTime
+  analyzedAt    DateTime @default(now())
+
+  @@unique([repoOwner, repoName])
+  @@index([analyzedAt])
+  @@index([repoOwner, repoName])
+}
