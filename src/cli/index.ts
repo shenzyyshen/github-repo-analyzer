@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import "dotenv/config";
 import { PrismaClient } from "@prisma/client";
 import { GithubAdapter } from "../adapters/github/GithubAdapter.js";
 import { PrismaAdapter } from "../adapters/database/PrismaAdapter.js";
