@@ -1,15 +1,15 @@
-import chalk from "chalk";
 import type { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { RepoApiPort } from "../ports/RepoApiPort.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
 import { createSpinner, renderSummary, renderTable, type AnalyzeRow } from "./display.js";
 import { RateLimitError } from "../adapters/github/GithubAdapter.js";
+import type { QueryTranslator } from "../ai/QueryTranslator.js";
 
 type SearchOptions = {
   language?: string;
-  minStars: number;
+  minStars?: number;
   since?: string;
-  sort: "stars" | "updated" | "forks";
+  sort?: "stars" | "updated" | "forks";
   random: boolean;
   json: boolean;
   top: number;
@@ -18,14 +18,22 @@ type SearchOptions = {
 export class SearchCommand {
   constructor(
     private readonly repoApiPort: RepoApiPort,
-    private readonly analyzeRepo: AnalyzeRepo
+    private readonly analyzeRepo: AnalyzeRepo,
+    private readonly translator: QueryTranslator
   ) {}
 
   async execute(query: string, options: SearchOptions): Promise<void> {
-    const since = options.since ?? this.getDefaultSince();
-    const q = this.buildQuery(query, options.language, options.minStars, since);
+    const translation = await this.translator.translate(query);
+    const since = options.since ?? translation.since ?? this.getDefaultSince();
+    const language = options.language ?? translation.language ?? undefined;
+    const minStars =
+      options.minStars !== undefined && options.minStars !== null
+        ? options.minStars
+        : translation.minStars ?? 0;
+    const sort = options.sort ?? translation.sort ?? "stars";
+    const q = this.buildQuery(translation.query, language, minStars, since);
 
-    const results = await this.repoApiPort.searchRepos(q, options.sort, 100);
+    const results = await this.repoApiPort.searchRepos(q, sort, 100);
 
     if (options.json) {
       process.stdout.write(JSON.stringify(results, null, 2));
