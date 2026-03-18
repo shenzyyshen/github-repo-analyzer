@@ -23,6 +23,7 @@ export class SearchCommand {
   ) {}
 
   async execute(query: string, options: SearchOptions): Promise<void> {
+    process.stdout.write("Translating query...\n");
     const translation = await this.translator.translate(query);
     const since = options.since ?? translation.since ?? this.getDefaultSince();
     const language = options.language ?? translation.language ?? undefined;
@@ -33,6 +34,7 @@ export class SearchCommand {
     const sort = options.sort ?? translation.sort ?? "stars";
     const q = this.buildQuery(translation.query, language, minStars, since);
 
+    process.stdout.write("Searching GitHub...\n");
     const results = await this.repoApiPort.searchRepos(q, sort, 100);
 
     if (options.json) {
@@ -44,6 +46,7 @@ export class SearchCommand {
       ? this.pickRandom(results, options.top)
       : results.slice(0, options.top);
 
+    process.stdout.write("Analyzing results...\n");
     const rows: AnalyzeRow[] = [];
     for (let i = 0; i < picked.length; i += 1) {
       const item = picked[i];

@@ -7,6 +7,7 @@
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
     "cli": "tsx src/cli/index.ts",
+    "agent": "tsx src/cli/agent.ts",
     "start": "node dist/index.js"
   },
   "engines": {

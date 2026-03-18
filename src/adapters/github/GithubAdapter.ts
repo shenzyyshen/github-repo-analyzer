@@ -84,7 +84,11 @@ export class GithubAdapter implements RepoApiPort {
     return Array.isArray(data) ? data.length : 0;
   }
 
-  async searchRepos(query: string, sort: string, perPage: number): Promise<SearchResult[]> {
+  async searchRepos(
+    query: string,
+    sort: "stars" | "updated" | "forks",
+    perPage: number
+  ): Promise<SearchResult[]> {
     const { data } = await this.withRetry(() =>
       this.client.search.repos({
         q: query,
@@ -95,7 +99,7 @@ export class GithubAdapter implements RepoApiPort {
     );
 
     return data.items.map((item) => ({
-      owner: item.owner.login,
+      owner: item.owner?.login ?? item.full_name.split("/")[0] ?? "",
       name: item.name,
       fullName: item.full_name,
       description: item.description ?? null,

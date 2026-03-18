@@ -15,7 +15,7 @@ export class QueryTranslator {
   private readonly client: OpenAI;
   private readonly model: string;
 
-  constructor(apiKey: string, model = "gpt-4.1-mini") {
+  constructor(apiKey: string, model = "gpt-3.5-turbo") {
     this.client = new OpenAI({ apiKey });
     this.model = model;
   }
@@ -35,14 +35,25 @@ export class QueryTranslator {
       `User: ${userQuery}`,
     ].join("\n");
 
-    const response = await this.client.responses.create({
-      model: this.model,
-      input: prompt,
-    });
+    try {
+      const response = await this.client.responses.create({
+        model: this.model,
+        input: prompt,
+      });
 
-    const text = response.output_text?.trim() ?? "";
-    const json = this.extractJson(text);
-    return TranslationSchema.parse(json);
+      const text = response.output_text?.trim() ?? "";
+      const json = this.extractJson(text);
+      return TranslationSchema.parse(json);
+    } catch (_err) {
+      console.warn("AI translation unavailable, using raw query");
+      return {
+        query: userQuery,
+        language: null,
+        minStars: 0,
+        since: null,
+        sort: "stars",
+      };
+    }
   }
 
   private extractJson(text: string): unknown {
