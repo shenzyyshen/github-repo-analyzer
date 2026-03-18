@@ -10,5 +10,9 @@ export interface RepoApiPort {
   getLanguages(owner: string, repo: string): Promise<Record<string, number>>;
   getIssues(owner: string, repo: string): Promise<number>;
   getContributors(owner: string, repo: string): Promise<number>;
-  searchRepos(query: string, sort: string, perPage: number): Promise<SearchResult[]>;
+  searchRepos(
+    query: string,
+    sort: "stars" | "updated" | "forks",
+    perPage: number
+  ): Promise<SearchResult[]>;
 }
