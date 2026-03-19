@@ -53,6 +53,37 @@ function buildGitHubQuery(search: NonNullable<SearchPlan["search"]>): string {
   return parts.join(" ");
 }
 
+function normalizeSearchQuery(input: string): string {
+  const cleaned = input
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter(
+      (word) =>
+        !new Set([
+          "find",
+          "top",
+          "best",
+          "repos",
+          "repo",
+          "for",
+          "building",
+          "build",
+          "with",
+          "using",
+          "that",
+          "a",
+          "an",
+          "the",
+          "in",
+          "to",
+        ]).has(word)
+    );
+
+  return cleaned.join(" ").trim();
+}
+
 function pickResults(results: SearchResult[], top: number, random: boolean): SearchResult[] {
   if (!random) return results.slice(0, top);
   const copy = [...results];
@@ -137,7 +168,7 @@ class AiBrain {
         reply: "I could not use the AI planner, so I am running a direct GitHub search.",
         followUp: "Do you want me to narrow by language, stars, or recency next?",
         search: {
-          query: userInput,
+          query: normalizeSearchQuery(userInput) || userInput,
           language: null,
           minStars: 0,
           since: null,
@@ -327,7 +358,18 @@ async function main() {
 
       output.write("Searching GitHub...\n");
       const query = buildGitHubQuery(plan.search);
-      const results = await githubAdapter.searchRepos(query, plan.search.sort, 100);
+      let results = await githubAdapter.searchRepos(query, plan.search.sort, 100);
+      if (results.length === 0) {
+        const relaxedQuery = normalizeSearchQuery(plan.search.query);
+        if (relaxedQuery && relaxedQuery !== plan.search.query) {
+          output.write(`Retrying with broader query: ${relaxedQuery}\n`);
+          results = await githubAdapter.searchRepos(
+            buildGitHubQuery({ ...plan.search, query: relaxedQuery }),
+            plan.search.sort,
+            100
+          );
+        }
+      }
       const picked = pickResults(results, plan.search.top, plan.search.random);
 
       output.write("Analyzing results...\n");
