@@ -104,6 +104,17 @@ npx prisma migrate dev --name init
 npm run cli -- search "react state management" --language ts --min-stars 1000
 ```
 
+### Conversational Agent
+```bash
+npm run agent
+```
+
+This starts an interactive terminal session that:
+- accepts a plain-English repo discovery request
+- searches and analyzes GitHub repos
+- responds conversationally
+- overwrites `reports/REPO_SCOUT_RESULTS.md` on each run with a timestamped shortlist report
+
 ### API server
 ```bash
 npm run dev

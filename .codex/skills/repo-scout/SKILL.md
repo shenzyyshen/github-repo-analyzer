@@ -21,12 +21,10 @@ Translate a natural-language request into a GitHub search query, fetch candidate
 5. Rank results and attach brief rationale
 
 ## Output
-Save a markdown report to `./reports/REPO_SCOUT.md` with sections:
-- Prompt
-- Search Query
-- Filters Applied
-- Top Results (table)
-- Notes / Rationale
+Save a markdown report to `./reports/REPO_SCOUT_RESULTS.md` with:
+- A timestamp at the top
+- A structured markdown table with columns: Repo, Stars, Language, Last Commit, Why Recommended, Score (1-10)
+- A short conversational summary explaining the overall recommendation and trade-offs
 
 ## Guardrails
 - Respect rate limits; analyze sequentially
