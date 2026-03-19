@@ -1,4 +1,6 @@
+#!/usr/bin/env node
 import "dotenv/config";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import OpenAI from "openai";
@@ -16,6 +18,28 @@ type Turn = {
   content: string;
 };
 
+type RepoContext = {
+  repo: SearchResult;
+  metrics: Metrics;
+  repoData: {
+    fullName: string;
+    description: string | null;
+    defaultBranch: string;
+    forks: number;
+    openIssues: number;
+    createdAt: Date;
+    pushedAt: Date;
+  };
+  languages: Record<string, number>;
+  contributors: number;
+  verifiedOpenIssues: number;
+};
+
+type ScoutSelectionContext = {
+  whyRecommended: string;
+  score: number | null;
+};
+
 type SearchPlan = {
   action: "search" | "clarify" | "exit";
   reply: string;
@@ -25,6 +49,7 @@ type SearchPlan = {
     language: string | null;
     minStars: number;
     since: string | null;
+    license: string | null;
     sort: "stars" | "updated" | "forks";
     top: number;
     random: boolean;
@@ -36,6 +61,19 @@ type AnalyzedRepo = {
   metrics: Metrics | null;
   error: string | null;
 };
+
+type SelectionChoice =
+  | { kind: "pick"; index: number }
+  | { kind: "none" }
+  | { kind: "back" }
+  | { kind: "exit" };
+
+type TextChoice =
+  | { kind: "text"; value: string }
+  | { kind: "back" }
+  | { kind: "exit" };
+
+const INVALID_SELECTION_MESSAGE = "Enter a number between 1-5, or type 'none' / 'quit'.";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -50,7 +88,156 @@ function buildGitHubQuery(search: NonNullable<SearchPlan["search"]>): string {
   if (search.language) parts.push(`language:${search.language}`);
   if (search.minStars > 0) parts.push(`stars:>${search.minStars}`);
   if (search.since) parts.push(`pushed:>${search.since}`);
+  if (search.license) parts.push(`license:${search.license}`);
   return parts.join(" ");
+}
+
+function isoDateDaysAgo(days: number): string {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function detectLanguage(input: string): string | null {
+  const patterns: Array<[RegExp, string]> = [
+    [/\bpython\b/, "Python"],
+    [/\btypescript\b|\btype script\b|\bts only\b/, "TypeScript"],
+    [/\bjavascript\b|\bjs\b/, "JavaScript"],
+    [/\brust\b/, "Rust"],
+    [/\bgo\b|\bgolang\b/, "Go"],
+    [/\bjava\b/, "Java"],
+    [/\bc#\b|\bcsharp\b/, "C#"],
+    [/\bphp\b/, "PHP"],
+    [/\bruby\b/, "Ruby"],
+    [/\bshell\b|\bbash\b/, "Shell"],
+  ];
+
+  for (const [pattern, language] of patterns) {
+    if (pattern.test(input)) return language;
+  }
+  return null;
+}
+
+function inferFilters(
+  userInput: string,
+  search: NonNullable<SearchPlan["search"]>
+): {
+  search: NonNullable<SearchPlan["search"]>;
+  applied: string[];
+} {
+  const input = userInput.toLowerCase();
+  const applied: string[] = [];
+  const next = { ...search };
+
+  const detectedLanguage = detectLanguage(input);
+  if (!next.language && detectedLanguage) {
+    next.language = detectedLanguage;
+    applied.push(`Language: ${detectedLanguage}`);
+  } else if (next.language) {
+    applied.push(`Language: ${next.language}`);
+  }
+
+  if (
+    !next.since &&
+    /\b(actively maintained|active maintenance|updated recently|recently updated|actively developed)\b/.test(
+      input
+    )
+  ) {
+    next.since = isoDateDaysAgo(90);
+    next.sort = "updated";
+    applied.push("Activity: updated in the last 90 days");
+  } else if (next.since) {
+    applied.push(`Activity: pushed after ${next.since}`);
+  }
+
+  if (/\blightweight\b/.test(input)) {
+    next.query = `${next.query} lightweight`.trim();
+    applied.push("Size/Maturity: lightweight");
+  }
+  if (/\bproduction[- ]ready\b/.test(input)) {
+    next.query = `${next.query} production-ready`.trim();
+    if (next.minStars < 1000) next.minStars = 1000;
+    applied.push("Size/Maturity: production-ready");
+  }
+  if (/\bwell documented\b|\bwell-documented\b|\bgood docs\b/.test(input)) {
+    next.query = `${next.query} documentation docs`.trim();
+    applied.push("Size/Maturity: well documented");
+  }
+
+  if (/\bmit only\b|\bmit licensed\b|\bmit license\b/.test(input)) {
+    next.license = "mit";
+    applied.push("License: MIT");
+  } else if (/\bapache\b/.test(input)) {
+    next.license = "apache-2.0";
+    applied.push("License: Apache-2.0");
+  } else if (/\bopen source\b/.test(input)) {
+    applied.push("License: open source");
+  }
+
+  const purposeTerms = normalizeSearchQuery(userInput)
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter(
+      (word) =>
+        ![
+          "python",
+          "typescript",
+          "javascript",
+          "rust",
+          "go",
+          "java",
+          "lightweight",
+          "production",
+          "ready",
+          "documented",
+          "mit",
+          "open",
+          "source",
+          "actively",
+          "maintained",
+          "updated",
+          "recently",
+        ].includes(word)
+    );
+  if (purposeTerms.length > 0) {
+    applied.push(`Purpose: ${purposeTerms.join(" ")}`);
+  }
+
+  return { search: next, applied };
+}
+
+function renderAppliedFilters(applied: string[]): string {
+  if (applied.length === 0) return "";
+  return ["Applied filters:", ...applied.map((item) => `- ${item}`), ""].join("\n");
+}
+
+function normalizeSearchQuery(input: string): string {
+  const cleaned = input
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter(
+      (word) =>
+        !new Set([
+          "find",
+          "top",
+          "best",
+          "repos",
+          "repo",
+          "for",
+          "building",
+          "build",
+          "with",
+          "using",
+          "that",
+          "a",
+          "an",
+          "the",
+          "in",
+          "to",
+        ]).has(word)
+    );
+
+  return cleaned.join(" ").trim();
 }
 
 function pickResults(results: SearchResult[], top: number, random: boolean): SearchResult[] {
@@ -88,6 +275,357 @@ function summarizeResults(results: AnalyzedRepo[]): string {
       ].join(" | ");
     })
     .join("\n");
+}
+
+function getLastCommit(item: AnalyzedRepo): Date {
+  return item.metrics?.lastCommit ?? item.search.pushedAt;
+}
+
+function getPrimaryLanguage(item: AnalyzedRepo): string {
+  if (item.metrics) {
+    const entries = Object.entries(item.metrics.languages);
+    if (entries.length > 0) {
+      entries.sort((a, b) => b[1] - a[1]);
+      return entries[0][0];
+    }
+  }
+  return item.search.language ?? "unknown";
+}
+
+function buildRecommendationReason(item: AnalyzedRepo): string {
+  const parts: string[] = [];
+  if (item.search.stars >= 50_000) {
+    parts.push("very widely adopted");
+  } else if (item.search.stars >= 10_000) {
+    parts.push("strong adoption");
+  }
+
+  const ageDays = Math.floor((Date.now() - getLastCommit(item).getTime()) / (24 * 60 * 60 * 1000));
+  if (ageDays <= 7) {
+    parts.push("recently active");
+  } else if (ageDays <= 30) {
+    parts.push("active in the last month");
+  }
+
+  if (!item.error && item.metrics && item.metrics.openIssues < 100) {
+    parts.push("manageable issue load");
+  }
+
+  if (parts.length === 0) {
+    parts.push("relevant match for the query");
+  }
+
+  return parts.join(", ");
+}
+
+function computeScore(item: AnalyzedRepo): number {
+  const starsScore = Math.min(5, Math.log10(Math.max(item.search.stars, 1)));
+  const ageDays = Math.floor((Date.now() - getLastCommit(item).getTime()) / (24 * 60 * 60 * 1000));
+  const recencyScore = ageDays <= 7 ? 3 : ageDays <= 30 ? 2 : ageDays <= 180 ? 1 : 0;
+  const issueScore =
+    item.metrics && !item.error
+      ? item.metrics.openIssues <= 50
+        ? 2
+        : item.metrics.openIssues <= 200
+        ? 1
+        : 0
+      : 0;
+  return Math.max(1, Math.min(10, Math.round(starsScore + recencyScore + issueScore)));
+}
+
+function buildShortlistNames(results: AnalyzedRepo[]): string {
+  const successful = results
+    .filter((item) => !item.error)
+    .slice(0, 3)
+    .map((item) => item.search.fullName);
+
+  if (successful.length > 0) {
+    return successful.join(", ");
+  }
+
+  return results
+    .slice(0, 3)
+    .map((item) => item.search.fullName)
+    .join(", ");
+}
+
+async function writeScoutReport(results: AnalyzedRepo[], summary: string): Promise<void> {
+  await mkdir("reports", { recursive: true });
+
+  const timestamp = new Date().toISOString();
+  const header = `# Repo Scout Results\n\nGenerated: ${timestamp}\n`;
+  const tableHeader = [
+    "| Repo | Stars | Language | Last Commit | Why Recommended | Score (1-10) |",
+    "| --- | ---: | --- | --- | --- | ---: |",
+  ];
+  const rows = results.map((item) => {
+    const repo = item.search.fullName;
+    const stars = item.search.stars.toLocaleString();
+    const language = getPrimaryLanguage(item);
+    const lastCommit = getLastCommit(item).toISOString().slice(0, 10);
+    const why = item.error ? `Analysis failed: ${item.error}` : buildRecommendationReason(item);
+    const score = computeScore(item);
+    return `| ${repo} | ${stars} | ${language} | ${lastCommit} | ${why} | ${score} |`;
+  });
+
+  const content = [
+    header,
+    "## Shortlist",
+    "",
+    ...tableHeader,
+    ...rows,
+    "",
+    "## Summary",
+    "",
+    summary.trim(),
+    "",
+  ].join("\n");
+
+  await writeFile("reports/REPO_SCOUT_RESULTS.md", content, "utf8");
+}
+
+function renderShortlist(results: AnalyzedRepo[]): string {
+  return results
+    .map((item, index) => `${index + 1}. ${item.search.fullName}`)
+    .join("\n");
+}
+
+async function promptForSelection(
+  rl: ReturnType<typeof createInterface>,
+  max: number
+): Promise<SelectionChoice> {
+  while (true) {
+    const selection = (
+      await rl.question(
+        "Which repo would you like to analyze in depth? Enter a number, or type 'none' to refine the search.\n> "
+      )
+    )
+      .trim()
+      .toLowerCase();
+
+    if (selection === "exit" || selection === "quit") {
+      output.write("Goodbye.\n");
+      return { kind: "exit" };
+    }
+
+    if (selection === "back") {
+      return { kind: "back" };
+    }
+
+    if (selection === "none") {
+      return { kind: "none" };
+    }
+
+    const index = Number(selection);
+    if (Number.isInteger(index) && index >= 1 && index <= max) {
+      return { kind: "pick", index: index - 1 };
+    }
+
+    output.write(`${INVALID_SELECTION_MESSAGE}\n`);
+  }
+}
+
+async function promptForRefinement(
+  rl: ReturnType<typeof createInterface>
+): Promise<TextChoice> {
+  while (true) {
+    const refinement = (await rl.question("What would you like to change about the search?\n> ")).trim();
+
+    if (refinement === "exit" || refinement === "quit") {
+      output.write("Goodbye.\n");
+      return { kind: "exit" };
+    }
+
+    if (refinement === "back") {
+      return { kind: "back" };
+    }
+
+    if (refinement) {
+      return { kind: "text", value: refinement };
+    }
+
+    output.write(INVALID_SELECTION_MESSAGE + "\n");
+  }
+}
+
+async function promptAfterAnalysis(
+  rl: ReturnType<typeof createInterface>
+): Promise<TextChoice> {
+  while (true) {
+    const nextStep = (
+      await rl.question("What next? Type 'back' to return to the shortlist, or enter a new search.\n> ")
+    ).trim();
+
+    if (nextStep === "exit" || nextStep === "quit") {
+      output.write("Goodbye.\n");
+      return { kind: "exit" };
+    }
+
+    if (nextStep === "back") {
+      return { kind: "back" };
+    }
+
+    if (nextStep) {
+      return { kind: "text", value: nextStep };
+    }
+
+    output.write(INVALID_SELECTION_MESSAGE + "\n");
+  }
+}
+
+function shouldExcludeRepo(repo: SearchResult, query: string, rejected: Set<string>): boolean {
+  if (!rejected.has(repo.fullName)) {
+    return false;
+  }
+
+  const normalizedQuery = query.toLowerCase();
+  return ![
+    repo.fullName.toLowerCase(),
+    repo.owner.toLowerCase(),
+    repo.name.toLowerCase(),
+  ].some((token) => normalizedQuery.includes(token));
+}
+
+async function buildRepoContext(
+  githubAdapter: GithubAdapter,
+  analyzeRepo: AnalyzeRepo,
+  repo: SearchResult
+): Promise<RepoContext> {
+  const [metrics, repoData, languages, contributors, verifiedOpenIssues] = await Promise.all([
+    analyzeRepo.execute(repo.owner, repo.name, true),
+    githubAdapter.getRepo(repo.owner, repo.name),
+    githubAdapter.getLanguages(repo.owner, repo.name),
+    githubAdapter.getContributors(repo.owner, repo.name),
+    githubAdapter.getIssues(repo.owner, repo.name),
+  ]);
+
+  return {
+    repo,
+    metrics,
+    repoData: {
+      fullName: repoData.fullName,
+      description: repoData.description,
+      defaultBranch: repoData.defaultBranch,
+      forks: repoData.forks,
+      openIssues: repoData.openIssues,
+      createdAt: repoData.createdAt,
+      pushedAt: repoData.pushedAt,
+    },
+    languages,
+    contributors,
+    verifiedOpenIssues,
+  };
+}
+
+async function loadScoutSelectionContext(
+  repoFullName: string
+): Promise<ScoutSelectionContext | null> {
+  try {
+    const content = await readFile("reports/REPO_SCOUT_RESULTS.md", "utf8");
+    const lines = content.split("\n");
+
+    for (const line of lines) {
+      if (!line.startsWith("|")) continue;
+      if (line.includes("Repo | Stars | Language")) continue;
+      if (line.includes("---")) continue;
+
+      const columns = line
+        .split("|")
+        .slice(1, -1)
+        .map((part) => part.trim());
+
+      if (columns.length < 6) continue;
+      if (columns[0] !== repoFullName) continue;
+
+      const score = Number(columns[5]);
+      return {
+        whyRecommended: columns[4],
+        score: Number.isNaN(score) ? null : score,
+      };
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeAnalysisReport(context: RepoContext): Promise<void> {
+  await mkdir("reports", { recursive: true });
+  const scoutContext = await loadScoutSelectionContext(context.repoData.fullName);
+
+  const languageLines = Object.entries(context.languages)
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, bytes]) => `- ${name}: ${bytes.toLocaleString()}`)
+    .join("\n");
+
+  const selectedSection = scoutContext
+    ? [
+        "## Why This Repo Was Selected",
+        "",
+        `Scout reasoning: ${scoutContext.whyRecommended}.`,
+        scoutContext.score !== null ? `Scout score: ${scoutContext.score}/10.` : null,
+        "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+    : "";
+
+  const concernsSection =
+    scoutContext && scoutContext.score !== null && scoutContext.score < 7
+      ? [
+          "## Scout Concerns",
+          "",
+          `The scout scored this repo ${scoutContext.score}/10, so review it with extra attention to the trade-offs implied by: ${scoutContext.whyRecommended}.`,
+          "",
+        ].join("\n")
+      : "";
+
+  const focusSection = scoutContext
+    ? [
+        "## Analysis Focus",
+        "",
+        `This analysis emphasizes the areas highlighted by the scout: ${scoutContext.whyRecommended}.`,
+        "",
+      ].join("\n")
+    : "";
+
+  const content = [
+    "# Repo Analysis",
+    "",
+    `Generated: ${new Date().toISOString()}`,
+    "",
+    selectedSection,
+    concernsSection,
+    focusSection,
+    "## Project Summary",
+    "",
+    `${context.repoData.fullName} is a ${context.repo.language ?? "software"} repository with ${context.metrics.stars.toLocaleString()} stars and ${context.contributors.toLocaleString()} contributors.`,
+    context.repoData.description ?? "No description provided.",
+    "",
+    "## Repository Metadata",
+    "",
+    `- Repo: ${context.repoData.fullName}`,
+    `- Default Branch: ${context.repoData.defaultBranch}`,
+    `- Created At: ${context.repoData.createdAt.toISOString()}`,
+    `- Last Push: ${context.repoData.pushedAt.toISOString()}`,
+    `- Forks: ${context.repoData.forks.toLocaleString()}`,
+    "",
+    "## Metrics Snapshot",
+    "",
+    `- Stars: ${context.metrics.stars.toLocaleString()}`,
+    `- 24h Growth: ${context.metrics.starGrowth24h}`,
+    `- Open Issues: ${context.verifiedOpenIssues.toLocaleString()}`,
+    `- Contributors: ${context.contributors.toLocaleString()}`,
+    `- Last Commit: ${context.metrics.lastCommit.toISOString()}`,
+    "",
+    "## Language Breakdown",
+    "",
+    languageLines || "- No language data available",
+    "",
+  ].join("\n");
+
+  await writeFile("reports/REPO_ANALYSIS.md", content, "utf8");
 }
 
 class AiBrain {
@@ -137,10 +675,11 @@ class AiBrain {
         reply: "I could not use the AI planner, so I am running a direct GitHub search.",
         followUp: "Do you want me to narrow by language, stars, or recency next?",
         search: {
-          query: userInput,
+          query: normalizeSearchQuery(userInput) || userInput,
           language: null,
           minStars: 0,
           since: null,
+          license: null,
           sort: "stars",
           top: 5,
           random: false,
@@ -180,12 +719,13 @@ class AiBrain {
       if (results.length === 0) {
         return "I did not find a strong match for that query. Do you want to narrow by framework, stars, or recency?";
       }
-      const names = results
-        .filter((item) => !item.error)
-        .slice(0, 3)
-        .map((item) => item.search.fullName)
-        .join(", ");
-      return `I found a shortlist worth checking: ${names}. Do you want me to narrow further by framework, stars, or maintenance activity?`;
+      const names = buildShortlistNames(results);
+      const failureCount = results.filter((item) => item.error).length;
+      const failureNote =
+        failureCount > 0
+          ? ` Some repo analyses failed, so this shortlist is based partly on search results.`
+          : "";
+      return `I found a shortlist worth checking: ${names}.${failureNote} Do you want me to narrow further by framework, stars, or maintenance activity?`;
     }
   }
 
@@ -250,6 +790,7 @@ class AiBrain {
           language: parsed.search.language ?? null,
           minStars: Math.max(0, Math.min(Number(parsed.search.minStars ?? 0), 1_000_000)),
           since: parsed.search.since ?? null,
+          license: null,
           sort:
             parsed.search.sort === "updated" || parsed.search.sort === "forks"
               ? parsed.search.sort
@@ -299,14 +840,21 @@ async function main() {
   const brain = new AiBrain();
   const rl = createInterface({ input, output });
   const history: Turn[] = [];
+  const rejectedRepos = new Set<string>();
+  let pendingInput: string | null = null;
 
-  output.write("🤖 GitHub Repo Analyzer — What are you looking for?\n");
+  output.write("\x1bc");
+  output.write("GitHub Repo Scout — what are you looking for?\n");
 
   try {
-    while (true) {
-      const userInput = (await rl.question("> ")).trim();
+    outer: while (true) {
+      const userInput = pendingInput ?? (await rl.question("> ")).trim();
+      pendingInput = null;
       if (!userInput) continue;
-      if (userInput === "exit" || userInput === "quit") break;
+      if (userInput === "exit" || userInput === "quit") {
+        output.write("Goodbye.\n");
+        break;
+      }
 
       history.push({ role: "user", content: userInput });
       output.write("Thinking...\n");
@@ -325,16 +873,93 @@ async function main() {
         continue;
       }
 
+      const inferred = inferFilters(userInput, plan.search);
+      const effectiveSearch = inferred.search;
       output.write("Searching GitHub...\n");
-      const query = buildGitHubQuery(plan.search);
-      const results = await githubAdapter.searchRepos(query, plan.search.sort, 100);
+      const query = buildGitHubQuery(effectiveSearch);
+      let results = await githubAdapter.searchRepos(query, effectiveSearch.sort, 100);
+      if (results.length === 0) {
+        const relaxedQuery = normalizeSearchQuery(effectiveSearch.query);
+        if (relaxedQuery && relaxedQuery !== effectiveSearch.query) {
+          output.write(`Retrying with broader query: ${relaxedQuery}\n`);
+          results = await githubAdapter.searchRepos(
+            buildGitHubQuery({ ...effectiveSearch, query: relaxedQuery }),
+            effectiveSearch.sort,
+            100
+          );
+        }
+      }
+      results = results.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
       const picked = pickResults(results, plan.search.top, plan.search.random);
 
       output.write("Analyzing results...\n");
       const analyzed = await analyzePickedRepos(analyzeRepo, picked);
-      const response = await brain.respond(history, userInput, plan.search, analyzed);
+      const response = await brain.respond(history, userInput, effectiveSearch, analyzed);
+      await writeScoutReport(analyzed, response);
+      const filterText = renderAppliedFilters(inferred.applied);
+      if (filterText) {
+        output.write(`${filterText}\n`);
+      }
       output.write(`${response}\n`);
       history.push({ role: "assistant", content: response });
+
+      if (analyzed.length === 0) {
+        continue;
+      }
+
+      output.write(`${renderShortlist(analyzed)}\n`);
+
+      shortlist: while (true) {
+        const selection = await promptForSelection(rl, analyzed.length);
+
+        if (selection.kind === "exit") {
+          return;
+        }
+
+        if (selection.kind === "back") {
+          break;
+        }
+
+        if (selection.kind === "none") {
+          analyzed.forEach((item) => rejectedRepos.add(item.search.fullName));
+          history.push({
+            role: "assistant",
+            content: `Previous Search (rejected): ${buildShortlistNames(analyzed)}`,
+          });
+
+          while (true) {
+            const refinement = await promptForRefinement(rl);
+            if (refinement.kind === "exit") {
+              return;
+            }
+            if (refinement.kind === "back") {
+              continue shortlist;
+            }
+
+            pendingInput = refinement.value;
+            continue outer;
+          }
+        }
+
+        const chosen = analyzed[selection.index].search;
+        output.write(`Running in-depth analysis for ${chosen.fullName}...\n`);
+        const repoContext = await buildRepoContext(githubAdapter, analyzeRepo, chosen);
+        await writeAnalysisReport(repoContext);
+        output.write("Report saved to ./reports/REPO_ANALYSIS.md\n");
+
+        while (true) {
+          const nextStep = await promptAfterAnalysis(rl);
+          if (nextStep.kind === "exit") {
+            return;
+          }
+          if (nextStep.kind === "back") {
+            continue shortlist;
+          }
+
+          pendingInput = nextStep.value;
+          continue outer;
+        }
+      }
     }
   } finally {
     rl.close();

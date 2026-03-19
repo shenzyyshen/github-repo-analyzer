@@ -3,11 +3,15 @@
   "version": "0.1.0",
   "description": "GitHub Repo Analyzer — Hexagonal (Ports & Adapters) architecture",
   "main": "dist/index.js",
+  "bin": {
+    "repo": "dist/cli/agent.js"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
     "cli": "tsx src/cli/index.ts",
     "agent": "tsx src/cli/agent.ts",
+    "repo": "tsx src/cli/agent.ts",
     "start": "node dist/index.js"
   },
   "engines": {
