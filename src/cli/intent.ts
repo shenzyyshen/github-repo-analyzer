@@ -21,6 +21,29 @@ export type ParsedIntent = {
   confidence: number;
 };
 
+export function shouldClarifyBeforeSearch(intent: ParsedIntent): boolean {
+  const structureCount =
+    (intent.language ? 1 : 0) +
+    (intent.since ? 1 : 0) +
+    (intent.license ? 1 : 0) +
+    intent.maturitySignals.length +
+    intent.displayTerms.length;
+
+  return intent.confidence < 0.4 && structureCount < 2;
+}
+
+export function buildClarificationPrompt(intent: ParsedIntent): string {
+  if (intent.displayTerms.length === 0 && intent.language === null) {
+    return "I am not confident I understood the repo type you want. Name the product category, stack, or deployment style you care about most.";
+  }
+
+  if (intent.displayTerms.length === 0) {
+    return "I need one more concrete signal before searching. Try naming the repo category, framework, or deployment style.";
+  }
+
+  return "I have a partial read on your request, but not enough to trust the results. Try adding the language, framework, or license you care about most.";
+}
+
 const STOP_WORDS = new Set([
   "find",
   "top",

@@ -11,9 +11,11 @@ import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { Metrics } from "../domain/entities/Metrics.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
 import {
+  buildClarificationPrompt,
   inferFilters,
   normalizeSearchQuery,
   renderAppliedFilters,
+  shouldClarifyBeforeSearch,
 } from "./intent.js";
 
 type Role = "user" | "assistant";
@@ -733,6 +735,18 @@ async function main() {
       const inferred = inferFilters(userInput, plan.search);
       const effectiveSearch = inferred.search;
       const { intent } = inferred;
+
+      if (shouldClarifyBeforeSearch(intent)) {
+        const filterText = renderAppliedFilters(inferred.applied);
+        if (filterText) {
+          output.write(`${filterText}\n`);
+        }
+        const response = buildClarificationPrompt(intent);
+        output.write(`${response}\n`);
+        history.push({ role: "assistant", content: response });
+        continue;
+      }
+
       output.write("Searching GitHub...\n");
       const query = buildGitHubQuery(effectiveSearch);
       let results = await githubAdapter.searchRepos(query, effectiveSearch.sort, 100);
