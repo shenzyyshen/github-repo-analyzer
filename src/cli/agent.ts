@@ -242,11 +242,101 @@ function tokenizeRepo(item: AnalyzedRepo): Set<string> {
   );
 }
 
+type PromptProfile = {
+  label: string;
+  strictQualityFloor: boolean;
+  bestFor: Record<RankedShortlistItem["fitType"], string>;
+};
+
+function buildPromptProfile(intent: ParsedIntent): PromptProfile {
+  const intentText = [intent.normalizedQuery, ...intent.displayTerms, ...intent.purposeTerms, ...intent.concepts]
+    .join(" ")
+    .toLowerCase();
+
+  if (/\bmcp\b/.test(intentText) && /\b(agent|coding|code|developer)\b/.test(intentText)) {
+    return {
+      label: "MCP-based coding assistants",
+      strictQualityFloor: true,
+      bestFor: {
+        "direct match": "teams building MCP-based coding assistants",
+        "adaptable framework": "teams wiring an orchestration layer around MCP coding workflows",
+        "production choice": "teams that want a more established MCP/coding integration starting point",
+        "niche option": "teams exploring a narrower MCP workflow or newer coding assistant",
+        "balanced option": "teams that want a practical MCP/coding starting point without a large platform bet",
+      },
+    };
+  }
+
+  if (intent.concepts.includes("monitoring") && intent.concepts.includes("self-hosted")) {
+    return {
+      label: "self-hosted monitoring for APIs and websites",
+      strictQualityFloor: true,
+      bestFor: {
+        "direct match": "teams running self-hosted API and website monitoring",
+        "adaptable framework": "teams that can extend a broader observability tool to their monitoring workflow",
+        "production choice": "teams that prefer a more proven monitoring project over the most targeted match",
+        "niche option": "teams evaluating a narrower or newer self-hosted monitoring option",
+        "balanced option": "teams that want a credible monitoring option without over-optimizing for one metric",
+      },
+    };
+  }
+
+  if (intent.concepts.includes("local-ai") && intent.concepts.includes("desktop-app")) {
+    return {
+      label: "desktop local LLM apps",
+      strictQualityFloor: false,
+      bestFor: {
+        "direct match": "teams building or adopting desktop local LLM apps",
+        "adaptable framework": "teams that can adapt a desktop AI foundation into a local LLM workflow",
+        "production choice": "teams that prefer a more established local AI project",
+        "niche option": "teams exploring a newer or more specialized local AI app",
+        "balanced option": "teams that want a practical local AI app without chasing the largest framework",
+      },
+    };
+  }
+
+  const label = intent.displayTerms[0] ?? "the request";
+  return {
+    label,
+    strictQualityFloor: false,
+    bestFor: {
+      "direct match": `teams that want the closest match to ${label}`,
+      "adaptable framework": `teams that can customize a framework around ${label}`,
+      "production choice": "teams that prefer a more proven and widely adopted repo",
+      "niche option": `teams evaluating a narrower or newer option in ${label}`,
+      "balanced option": "teams looking for a balanced compromise between fit and maturity",
+    },
+  };
+}
+
 function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedShortlistItem[] {
-  const promptLabel = intent.displayTerms[0] ?? "the request";
+  const prompt = buildPromptProfile(intent);
   const scored = results.map((item) => {
     const tokens = tokenizeRepo(item);
     const promptFit = intent.purposeTerms.filter((term) => tokens.has(term)).length;
+    const intentText = [intent.normalizedQuery, ...intent.displayTerms, ...intent.purposeTerms, ...intent.concepts]
+      .join(" ")
+      .toLowerCase();
+    const mcpQuery = /\bmcp\b/.test(intentText) && /\b(agent|coding|code|developer)\b/.test(intentText);
+    const repoText = [item.search.fullName, item.search.description ?? "", getPrimaryLanguage(item)].join(" ").toLowerCase();
+    const repoDescriptor =
+      /\borchestrator|workflow\b/.test(repoText)
+        ? "orchestration"
+        : /\bstudio|gui|electron|desktop\b/.test(repoText)
+          ? "ui"
+          : /\bserver\b/.test(repoText)
+            ? "server"
+            : /\bcli\b/.test(repoText)
+              ? "cli"
+              : /\bframework|sdk|platform|toolkit\b/.test(repoText)
+                ? "framework"
+                : "general";
+    const mcpRelevance =
+      mcpQuery
+        ? Number(/\bmcp\b|\bmodel context protocol\b/.test(repoText)) +
+          Number(/\b(agent|assistant|orchestrator|workflow)\b/.test(repoText)) +
+          Number(/\b(code|coding|developer|dev)\b/.test(repoText))
+        : 0;
     const stars = item.search.stars;
     const forks = item.search.forks;
     const contributors = getContributorCount(item);
@@ -280,8 +370,49 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
       item.search.description ?? ""
     );
 
+    const passesQualityFloor = prompt.strictQualityFloor
+      ? ((stars >= 50 && repoAgeDays >= 45 && contributors >= 2) ||
+          (promptFit + mcpRelevance >= 3 && (stars >= 20 || forks >= 5) && repoAgeDays >= 30))
+      : (stars >= 10 || forks >= 2 || contributors >= 2 || repoAgeDays >= 30 || promptFit >= 2);
+
+    if (!passesQualityFloor) {
+      return null;
+    }
+
+    const fitScore = Math.min(
+      3,
+      promptFit + (mcpQuery ? Math.min(2, mcpRelevance) : 0) >= 4
+        ? 3
+        : promptFit + (mcpQuery ? Math.min(2, mcpRelevance) : 0) >= 2
+          ? 2
+          : promptFit >= 1 || mcpRelevance >= 1
+            ? 1
+            : 0
+    );
+    const adoptionRubric =
+      stars >= 25_000 || forks >= 2_500 || contributors >= 100
+        ? 3
+        : stars >= 5_000 || forks >= 500 || contributors >= 25
+          ? 2
+          : stars >= 250 || forks >= 25 || contributors >= 5
+            ? 1
+            : 0;
+    const maintenanceRubric =
+      ageDays <= 30
+        ? 2
+        : ageDays <= 120
+          ? 1
+          : 0;
+    const maturityRubric =
+      repoAgeDays >= 365 * 2
+        ? 2
+        : repoAgeDays >= 180
+          ? 1
+          : 0;
+    const bonusRubric = Math.min(1, maintainabilityScore > 0 || velocityScore > 0 ? 1 : 0);
+
     const fitType: RankedShortlistItem["fitType"] =
-      promptFit >= 2
+      fitScore >= 2
         ? "direct match"
         : frameworkLike
           ? "adaptable framework"
@@ -291,39 +422,49 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
               ? "niche option"
               : "balanced option";
 
-    const weightedScore =
-      promptFit * 3 +
-      adoptionScore * 2 +
-      maturityScore * 1.5 +
-      activityScore * 1.25 +
-      maintainabilityScore +
-      velocityScore;
+    const descriptorBonus =
+      mcpQuery
+        ? repoDescriptor === "server"
+          ? 0.75
+          : repoDescriptor === "orchestration"
+            ? 0.5
+            : repoDescriptor === "framework"
+              ? 0.25
+              : 0
+        : 0;
+
+    const weightedScore = fitScore + adoptionRubric + maintenanceRubric + maturityRubric + bonusRubric + descriptorBonus;
 
     const whyParts: string[] = [];
-    if (promptFit >= 2) whyParts.push(`closest fit for ${promptLabel}`);
-    else if (fitType === "adaptable framework") whyParts.push("flexible base you can adapt to the use case");
-    else if (fitType === "production choice") whyParts.push("strong adoption and maturity signal");
-    else if (fitType === "niche option") whyParts.push("more specialized option for the prompt");
-    else whyParts.push("balanced tradeoff between fit and maturity");
-    if (adoptionScore >= 3) whyParts.push("strong adoption signal");
-    if (maturityScore >= 2) whyParts.push("project looks established");
-    if (activityScore >= 2) whyParts.push("active maintenance");
-    if (maintainabilityScore >= 1) whyParts.push("issue load looks manageable");
-    if (velocityScore >= 1) whyParts.push("good growth relative to repo age");
+    if (fitScore >= 3) whyParts.push(`most direct fit for ${prompt.label}`);
+    else if (fitType === "adaptable framework") whyParts.push("adaptable foundation for this workflow");
+    else if (fitType === "production choice") whyParts.push("maturity and adoption are stronger than the rest of the field");
+    else if (fitType === "niche option") whyParts.push("specialized option that matches part of the prompt");
+    else if (descriptorBonus > 0) whyParts.push(`${repoDescriptor} shape matches the workflow`);
+    if (adoptionRubric >= 2) whyParts.push("strong adoption");
+    if (maturityRubric >= 1) whyParts.push("established repo age");
+    if (maintenanceRubric >= 1) whyParts.push("recent maintenance");
+    if (mcpQuery && mcpRelevance >= 2) whyParts.push("clear MCP/coding relevance");
 
     let tradeoff: string | null = null;
     if (fitType === "adaptable framework") tradeoff = "more setup required than a purpose-built tool";
     else if (fitType === "production choice") tradeoff = "broader scope than the most targeted option";
     else if (fitType === "niche option") tradeoff = "lower adoption signal than the top picks";
     else if (repoAgeDays < 180) tradeoff = "project is still relatively new";
-    else if (promptFit < 2) tradeoff = "fit is broader than the exact prompt";
+    else if (fitScore < 2) tradeoff = "fit is broader than the exact prompt";
 
-    let bestFor = "";
-    if (fitType === "direct match") bestFor = `teams that want a direct ${promptLabel} solution`;
-    else if (fitType === "adaptable framework") bestFor = `teams willing to customize a framework for ${promptLabel}`;
-    else if (fitType === "production choice") bestFor = "teams prioritizing maturity and adoption";
-    else if (fitType === "niche option") bestFor = `teams exploring a focused ${promptLabel} option`;
-    else bestFor = "teams balancing fit, maturity, and ease of evaluation";
+    let bestFor = prompt.bestFor[fitType];
+    if (mcpQuery) {
+      if (repoDescriptor === "server") {
+        bestFor = "teams integrating a lightweight MCP server into coding workflows";
+      } else if (repoDescriptor === "orchestration") {
+        bestFor = "teams orchestrating multi-agent coding workflows around MCP";
+      } else if (repoDescriptor === "ui") {
+        bestFor = "teams exploring a UI-first coding assistant environment";
+      } else if (repoDescriptor === "framework") {
+        bestFor = "teams building a broader coding-agent platform with MCP support";
+      }
+    }
 
     return {
       item,
@@ -333,7 +474,7 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
       bestFor,
       fitType,
     };
-  });
+  }).filter(Boolean) as RankedShortlistItem[];
 
   const ranked: RankedShortlistItem[] = [];
   const seenTypes = new Set<string>();
@@ -366,7 +507,7 @@ function buildCaution(item: AnalyzedRepo): string | null {
   if (ageDays > 180) {
     return "not recently active";
   }
-  if (item.search.stars < 100) {
+  if (item.search.stars < 25) {
     return "low adoption signal";
   }
 
@@ -445,7 +586,7 @@ function renderShortlist(results: RankedShortlistItem[]): string {
         `   Score: ${ranked.score}/10`,
         `   Best for: ${ranked.bestFor}`,
         `   Why: ${ranked.why}`,
-        `   Tradeoff: ${ranked.tradeoff ?? "minimal known downside from the current snapshot"}`,
+        ranked.tradeoff ? `   Tradeoff: ${ranked.tradeoff}` : null,
         caution ? `   Caution: ${caution}` : null,
         `   Stars: ${stars} | Forks: ${forks} | Contributors: ${contributors}`,
         `   Age: ${age} | Last push: ${lastCommit} | Language: ${language}`,

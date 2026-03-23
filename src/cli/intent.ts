@@ -378,8 +378,6 @@ export function inferFilters(
     applied.push(`Purpose: ${intent.purposeTerms.join(" ")}`);
   }
 
-  applied.push(`Intent confidence: ${Math.round(intent.confidence * 100)}%`);
-
   return { search: next, applied, intent };
 }
 
