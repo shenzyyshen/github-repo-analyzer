@@ -340,7 +340,6 @@ export function inferFilters(
 
   if (!next.since && intent.since) {
     next.since = intent.since;
-    next.sort = "updated";
     applied.push("Activity: updated in the last 90 days");
   } else if (next.since) {
     applied.push(`Activity: pushed after ${next.since}`);
