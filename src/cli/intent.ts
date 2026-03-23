@@ -14,11 +14,19 @@ export type ParsedIntent = {
   since: string | null;
   license: string | null;
   maturitySignals: string[];
+  concepts: string[];
   purposeTerms: string[];
   boostTerms: string[];
   displayTerms: string[];
   normalizedQuery: string;
   confidence: number;
+};
+
+type IntentConcept = {
+  name: string;
+  display: string;
+  patterns: RegExp[];
+  boostTerms: string[];
 };
 
 export function shouldClarifyBeforeSearch(intent: ParsedIntent): boolean {
@@ -42,6 +50,18 @@ export function buildClarificationPrompt(intent: ParsedIntent): string {
   }
 
   return "I have a partial read on your request, but not enough to trust the results. Try adding the language, framework, or license you care about most.";
+}
+
+export function buildBroaderSearchQuery(intent: ParsedIntent): string | null {
+  const conceptTerms = [...new Set(intent.concepts.flatMap((concept) => conceptBroadTerms(concept)))];
+  const broaderTerms =
+    conceptTerms.length > 0
+      ? [...conceptTerms, ...intent.boostTerms.filter((term) => !["observability", "statuspage"].includes(term))]
+      : [...intent.boostTerms, ...intent.purposeTerms.slice(0, 3)];
+
+  const uniqueTerms = [...new Set(broaderTerms)].filter(Boolean);
+  if (uniqueTerms.length === 0) return null;
+  return uniqueTerms.join(" ");
 }
 
 const STOP_WORDS = new Set([
@@ -130,6 +150,57 @@ const BOOSTABLE_TERMS = new Set([
   "llm",
 ]);
 
+const INTENT_CONCEPTS: IntentConcept[] = [
+  {
+    name: "local-ai",
+    display: "local LLM chat / inference",
+    patterns: [/\blocal(?:-|\s)?llm\b/, /\bollama\b/, /\binference\b/, /\bllm\b/, /\bchat\b/],
+    boostTerms: ["ollama", "llm", "inference", "chat"],
+  },
+  {
+    name: "desktop-app",
+    display: "desktop app",
+    patterns: [/\bdesktop(?:-|\s)?app\b/, /\bdesktop\b/, /\belectron\b/, /\bgui\b/],
+    boostTerms: ["desktop-app", "electron", "gui"],
+  },
+  {
+    name: "self-hosted",
+    display: "self-hosted",
+    patterns: [/\bself-hosted\b/, /\bself hosted\b/],
+    boostTerms: ["self-hosted"],
+  },
+  {
+    name: "rest-api",
+    display: "REST API",
+    patterns: [/\brest(?:-|\s)?api\b/, /\bapi-framework\b/, /\bapi server\b/],
+    boostTerms: ["rest-api", "api-framework"],
+  },
+  {
+    name: "http-client",
+    display: "HTTP client",
+    patterns: [/\bhttp(?:-|\s)?client\b/, /\bapi-client\b/],
+    boostTerms: ["http-client", "api-client"],
+  },
+  {
+    name: "realtime",
+    display: "real-time / websocket",
+    patterns: [/\brealtime\b/, /\breal(?:-|\s)?time\b/, /\bwebsocket\b/],
+    boostTerms: ["realtime", "websocket"],
+  },
+  {
+    name: "monitoring",
+    display: "monitoring / observability",
+    patterns: [/\bmonitoring\b/, /\bobservability\b/, /\buptime\b/, /\bstatus page\b/],
+    boostTerms: ["monitoring", "observability", "uptime", "statuspage"],
+  },
+  {
+    name: "developer-tooling",
+    display: "developer tooling",
+    patterns: [/\bdeveloper tooling\b/, /\bdevtool\b/, /\bcli\b/, /\bterminal\b/],
+    boostTerms: ["cli", "terminal", "developer-tooling"],
+  },
+];
+
 export function detectLanguage(input: string): string | null {
   const patterns: Array<[RegExp, string]> = [
     [/\bpython\b/, "Python"],
@@ -207,15 +278,10 @@ export function parseIntent(userInput: string): ParsedIntent {
     maturitySignals.push("well documented");
   }
 
-  const displayTerms = new Set<string>();
-  if (/\bdesktop-app\b|\bdesktop\b/.test(expanded)) displayTerms.add("desktop app");
-  if (/\blocal-llm\b|\bllm\b|\bollama\b|\binference\b|\bchat\b/.test(expanded)) {
-    displayTerms.add("local LLM chat / inference");
-  }
-  if (/\bself-hosted\b/.test(expanded)) displayTerms.add("self-hosted");
-  if (/\brest-api\b|\bapi-framework\b/.test(expanded)) displayTerms.add("REST API");
-  if (/\bhttp-client\b|\bapi-client\b/.test(expanded)) displayTerms.add("HTTP client");
-  if (/\brealtime\b|\bwebsocket\b/.test(expanded)) displayTerms.add("real-time / websocket");
+  const matchedConcepts = INTENT_CONCEPTS.filter((concept) =>
+    concept.patterns.some((pattern) => pattern.test(expanded))
+  );
+  const displayTerms = new Set<string>(matchedConcepts.map((concept) => concept.display));
 
   const purposeTerms = expanded
     .replace(/[^\w\s-]/g, " ")
@@ -226,14 +292,16 @@ export function parseIntent(userInput: string): ParsedIntent {
     .filter((word) => !PURPOSE_STOP_WORDS.has(word));
 
   const uniquePurposeTerms = [...new Set(purposeTerms)];
-  const boostTerms = uniquePurposeTerms.filter((term) => BOOSTABLE_TERMS.has(term));
+  const conceptBoostTerms = matchedConcepts.flatMap((concept) => concept.boostTerms);
+  const boostTerms = [...new Set([...conceptBoostTerms, ...uniquePurposeTerms.filter((term) => BOOSTABLE_TERMS.has(term))])];
 
   const signalCount =
     (language ? 1 : 0) +
     (since ? 1 : 0) +
     (license ? 1 : 0) +
     maturitySignals.length +
-    Math.min(3, uniquePurposeTerms.length);
+    Math.min(3, uniquePurposeTerms.length) +
+    Math.min(2, matchedConcepts.length);
   const confidence = Math.min(1, signalCount / 6);
 
   return {
@@ -241,6 +309,7 @@ export function parseIntent(userInput: string): ParsedIntent {
     since,
     license,
     maturitySignals,
+    concepts: matchedConcepts.map((concept) => concept.name),
     purposeTerms: uniquePurposeTerms,
     boostTerms,
     displayTerms: [...displayTerms],
@@ -322,4 +391,27 @@ export function renderAppliedFilters(applied: string[]): string {
 
 function isoDateDaysAgo(days: number): string {
   return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function conceptBroadTerms(concept: string): string[] {
+  switch (concept) {
+    case "local-ai":
+      return ["ollama", "llm", "inference", "chat"];
+    case "desktop-app":
+      return ["desktop", "electron", "gui"];
+    case "self-hosted":
+      return ["self-hosted"];
+    case "rest-api":
+      return ["rest-api", "api-framework", "api"];
+    case "http-client":
+      return ["http-client", "api-client"];
+    case "realtime":
+      return ["realtime", "websocket"];
+    case "monitoring":
+      return ["monitoring", "uptime", "status", "page"];
+    case "developer-tooling":
+      return ["cli", "terminal", "developer-tooling"];
+    default:
+      return [];
+  }
 }
