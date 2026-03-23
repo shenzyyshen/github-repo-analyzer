@@ -10,6 +10,11 @@ import { PrismaAdapter } from "../adapters/database/PrismaAdapter.js";
 import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { Metrics } from "../domain/entities/Metrics.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
+import {
+  inferFilters,
+  normalizeSearchQuery,
+  renderAppliedFilters,
+} from "./intent.js";
 
 type Role = "user" | "assistant";
 
@@ -90,154 +95,6 @@ function buildGitHubQuery(search: NonNullable<SearchPlan["search"]>): string {
   if (search.since) parts.push(`pushed:>${search.since}`);
   if (search.license) parts.push(`license:${search.license}`);
   return parts.join(" ");
-}
-
-function isoDateDaysAgo(days: number): string {
-  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-}
-
-function detectLanguage(input: string): string | null {
-  const patterns: Array<[RegExp, string]> = [
-    [/\bpython\b/, "Python"],
-    [/\btypescript\b|\btype script\b|\bts only\b/, "TypeScript"],
-    [/\bjavascript\b|\bjs\b/, "JavaScript"],
-    [/\brust\b/, "Rust"],
-    [/\bgo\b|\bgolang\b/, "Go"],
-    [/\bjava\b/, "Java"],
-    [/\bc#\b|\bcsharp\b/, "C#"],
-    [/\bphp\b/, "PHP"],
-    [/\bruby\b/, "Ruby"],
-    [/\bshell\b|\bbash\b/, "Shell"],
-  ];
-
-  for (const [pattern, language] of patterns) {
-    if (pattern.test(input)) return language;
-  }
-  return null;
-}
-
-function inferFilters(
-  userInput: string,
-  search: NonNullable<SearchPlan["search"]>
-): {
-  search: NonNullable<SearchPlan["search"]>;
-  applied: string[];
-} {
-  const input = userInput.toLowerCase();
-  const applied: string[] = [];
-  const next = { ...search };
-
-  const detectedLanguage = detectLanguage(input);
-  if (!next.language && detectedLanguage) {
-    next.language = detectedLanguage;
-    applied.push(`Language: ${detectedLanguage}`);
-  } else if (next.language) {
-    applied.push(`Language: ${next.language}`);
-  }
-
-  if (
-    !next.since &&
-    /\b(actively maintained|active maintenance|updated recently|recently updated|actively developed)\b/.test(
-      input
-    )
-  ) {
-    next.since = isoDateDaysAgo(90);
-    next.sort = "updated";
-    applied.push("Activity: updated in the last 90 days");
-  } else if (next.since) {
-    applied.push(`Activity: pushed after ${next.since}`);
-  }
-
-  if (/\blightweight\b/.test(input)) {
-    next.query = `${next.query} lightweight`.trim();
-    applied.push("Size/Maturity: lightweight");
-  }
-  if (/\bproduction[- ]ready\b/.test(input)) {
-    next.query = `${next.query} production-ready`.trim();
-    if (next.minStars < 1000) next.minStars = 1000;
-    applied.push("Size/Maturity: production-ready");
-  }
-  if (/\bwell documented\b|\bwell-documented\b|\bgood docs\b/.test(input)) {
-    next.query = `${next.query} documentation docs`.trim();
-    applied.push("Size/Maturity: well documented");
-  }
-
-  if (/\bmit only\b|\bmit licensed\b|\bmit license\b/.test(input)) {
-    next.license = "mit";
-    applied.push("License: MIT");
-  } else if (/\bapache\b/.test(input)) {
-    next.license = "apache-2.0";
-    applied.push("License: Apache-2.0");
-  } else if (/\bopen source\b/.test(input)) {
-    applied.push("License: open source");
-  }
-
-  const purposeTerms = normalizeSearchQuery(userInput)
-    .split(/\s+/)
-    .filter(Boolean)
-    .filter(
-      (word) =>
-        ![
-          "python",
-          "typescript",
-          "javascript",
-          "rust",
-          "go",
-          "java",
-          "lightweight",
-          "production",
-          "ready",
-          "documented",
-          "mit",
-          "open",
-          "source",
-          "actively",
-          "maintained",
-          "updated",
-          "recently",
-        ].includes(word)
-    );
-  if (purposeTerms.length > 0) {
-    applied.push(`Purpose: ${purposeTerms.join(" ")}`);
-  }
-
-  return { search: next, applied };
-}
-
-function renderAppliedFilters(applied: string[]): string {
-  if (applied.length === 0) return "";
-  return ["Applied filters:", ...applied.map((item) => `- ${item}`), ""].join("\n");
-}
-
-function normalizeSearchQuery(input: string): string {
-  const cleaned = input
-    .toLowerCase()
-    .replace(/[^\w\s-]/g, " ")
-    .split(/\s+/)
-    .filter(Boolean)
-    .filter(
-      (word) =>
-        !new Set([
-          "find",
-          "top",
-          "best",
-          "repos",
-          "repo",
-          "for",
-          "building",
-          "build",
-          "with",
-          "using",
-          "that",
-          "a",
-          "an",
-          "the",
-          "in",
-          "to",
-        ]).has(word)
-    );
-
-  return cleaned.join(" ").trim();
 }
 
 function pickResults(results: SearchResult[], top: number, random: boolean): SearchResult[] {
@@ -875,10 +732,23 @@ async function main() {
 
       const inferred = inferFilters(userInput, plan.search);
       const effectiveSearch = inferred.search;
+      const { intent } = inferred;
       output.write("Searching GitHub...\n");
       const query = buildGitHubQuery(effectiveSearch);
       let results = await githubAdapter.searchRepos(query, effectiveSearch.sort, 100);
       if (results.length === 0) {
+        if (intent.confidence < 0.4) {
+          const filterText = renderAppliedFilters(inferred.applied);
+          if (filterText) {
+            output.write(`${filterText}\n`);
+          }
+          const response =
+            "I am not confident I interpreted that request correctly. Try naming the product type, language, or license you care about most.";
+          output.write(`${response}\n`);
+          history.push({ role: "assistant", content: response });
+          continue;
+        }
+
         const relaxedQuery = normalizeSearchQuery(effectiveSearch.query);
         if (relaxedQuery && relaxedQuery !== effectiveSearch.query) {
           output.write(`Retrying with broader query: ${relaxedQuery}\n`);
@@ -894,7 +764,12 @@ async function main() {
 
       output.write("Analyzing results...\n");
       const analyzed = await analyzePickedRepos(analyzeRepo, picked);
-      const response = await brain.respond(history, userInput, effectiveSearch, analyzed);
+      const response =
+        analyzed.length === 0
+          ? intent.confidence < 0.4
+            ? "I still do not have a confident read on that request. Try specifying the repo category, stack, or deployment style."
+            : "I did not find strong matches for that query. Try narrowing by framework, language, stars, or maintenance level."
+          : await brain.respond(history, userInput, effectiveSearch, analyzed);
       await writeScoutReport(analyzed, response);
       const filterText = renderAppliedFilters(inferred.applied);
       if (filterText) {
