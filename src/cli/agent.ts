@@ -10,6 +10,15 @@ import { PrismaAdapter } from "../adapters/database/PrismaAdapter.js";
 import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { Metrics } from "../domain/entities/Metrics.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
+import {
+  buildBroaderSearchQuery,
+  buildClarificationPrompt,
+  inferFilters,
+  normalizeSearchQuery,
+  type ParsedIntent,
+  renderAppliedFilters,
+  shouldClarifyBeforeSearch,
+} from "./intent.js";
 
 type Role = "user" | "assistant";
 
@@ -62,6 +71,15 @@ type AnalyzedRepo = {
   error: string | null;
 };
 
+type RankedShortlistItem = {
+  item: AnalyzedRepo;
+  score: number;
+  bestFor: string;
+  why: string;
+  tradeoff: string | null;
+  fitType: "direct match" | "production choice" | "adaptable framework" | "niche option" | "balanced option";
+};
+
 type SelectionChoice =
   | { kind: "pick"; index: number }
   | { kind: "none" }
@@ -90,154 +108,6 @@ function buildGitHubQuery(search: NonNullable<SearchPlan["search"]>): string {
   if (search.since) parts.push(`pushed:>${search.since}`);
   if (search.license) parts.push(`license:${search.license}`);
   return parts.join(" ");
-}
-
-function isoDateDaysAgo(days: number): string {
-  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-}
-
-function detectLanguage(input: string): string | null {
-  const patterns: Array<[RegExp, string]> = [
-    [/\bpython\b/, "Python"],
-    [/\btypescript\b|\btype script\b|\bts only\b/, "TypeScript"],
-    [/\bjavascript\b|\bjs\b/, "JavaScript"],
-    [/\brust\b/, "Rust"],
-    [/\bgo\b|\bgolang\b/, "Go"],
-    [/\bjava\b/, "Java"],
-    [/\bc#\b|\bcsharp\b/, "C#"],
-    [/\bphp\b/, "PHP"],
-    [/\bruby\b/, "Ruby"],
-    [/\bshell\b|\bbash\b/, "Shell"],
-  ];
-
-  for (const [pattern, language] of patterns) {
-    if (pattern.test(input)) return language;
-  }
-  return null;
-}
-
-function inferFilters(
-  userInput: string,
-  search: NonNullable<SearchPlan["search"]>
-): {
-  search: NonNullable<SearchPlan["search"]>;
-  applied: string[];
-} {
-  const input = userInput.toLowerCase();
-  const applied: string[] = [];
-  const next = { ...search };
-
-  const detectedLanguage = detectLanguage(input);
-  if (!next.language && detectedLanguage) {
-    next.language = detectedLanguage;
-    applied.push(`Language: ${detectedLanguage}`);
-  } else if (next.language) {
-    applied.push(`Language: ${next.language}`);
-  }
-
-  if (
-    !next.since &&
-    /\b(actively maintained|active maintenance|updated recently|recently updated|actively developed)\b/.test(
-      input
-    )
-  ) {
-    next.since = isoDateDaysAgo(90);
-    next.sort = "updated";
-    applied.push("Activity: updated in the last 90 days");
-  } else if (next.since) {
-    applied.push(`Activity: pushed after ${next.since}`);
-  }
-
-  if (/\blightweight\b/.test(input)) {
-    next.query = `${next.query} lightweight`.trim();
-    applied.push("Size/Maturity: lightweight");
-  }
-  if (/\bproduction[- ]ready\b/.test(input)) {
-    next.query = `${next.query} production-ready`.trim();
-    if (next.minStars < 1000) next.minStars = 1000;
-    applied.push("Size/Maturity: production-ready");
-  }
-  if (/\bwell documented\b|\bwell-documented\b|\bgood docs\b/.test(input)) {
-    next.query = `${next.query} documentation docs`.trim();
-    applied.push("Size/Maturity: well documented");
-  }
-
-  if (/\bmit only\b|\bmit licensed\b|\bmit license\b/.test(input)) {
-    next.license = "mit";
-    applied.push("License: MIT");
-  } else if (/\bapache\b/.test(input)) {
-    next.license = "apache-2.0";
-    applied.push("License: Apache-2.0");
-  } else if (/\bopen source\b/.test(input)) {
-    applied.push("License: open source");
-  }
-
-  const purposeTerms = normalizeSearchQuery(userInput)
-    .split(/\s+/)
-    .filter(Boolean)
-    .filter(
-      (word) =>
-        ![
-          "python",
-          "typescript",
-          "javascript",
-          "rust",
-          "go",
-          "java",
-          "lightweight",
-          "production",
-          "ready",
-          "documented",
-          "mit",
-          "open",
-          "source",
-          "actively",
-          "maintained",
-          "updated",
-          "recently",
-        ].includes(word)
-    );
-  if (purposeTerms.length > 0) {
-    applied.push(`Purpose: ${purposeTerms.join(" ")}`);
-  }
-
-  return { search: next, applied };
-}
-
-function renderAppliedFilters(applied: string[]): string {
-  if (applied.length === 0) return "";
-  return ["Applied filters:", ...applied.map((item) => `- ${item}`), ""].join("\n");
-}
-
-function normalizeSearchQuery(input: string): string {
-  const cleaned = input
-    .toLowerCase()
-    .replace(/[^\w\s-]/g, " ")
-    .split(/\s+/)
-    .filter(Boolean)
-    .filter(
-      (word) =>
-        !new Set([
-          "find",
-          "top",
-          "best",
-          "repos",
-          "repo",
-          "for",
-          "building",
-          "build",
-          "with",
-          "using",
-          "that",
-          "a",
-          "an",
-          "the",
-          "in",
-          "to",
-        ]).has(word)
-    );
-
-  return cleaned.join(" ").trim();
 }
 
 function pickResults(results: SearchResult[], top: number, random: boolean): SearchResult[] {
@@ -333,8 +203,321 @@ function computeScore(item: AnalyzedRepo): number {
   return Math.max(1, Math.min(10, Math.round(starsScore + recencyScore + issueScore)));
 }
 
-function buildShortlistNames(results: AnalyzedRepo[]): string {
+function buildRepoUrl(fullName: string): string {
+  return `https://github.com/${fullName}`;
+}
+
+function getRepoAgeDays(item: AnalyzedRepo): number {
+  return Math.max(
+    1,
+    Math.floor((Date.now() - item.search.createdAt.getTime()) / (24 * 60 * 60 * 1000))
+  );
+}
+
+function getRepoAgeLabel(item: AnalyzedRepo): string {
+  const days = getRepoAgeDays(item);
+  if (days < 30) return `${days}d`;
+  const months = Math.floor(days / 30);
+  if (months < 24) return `${months}mo`;
+  return `${Math.floor(months / 12)}y`;
+}
+
+function getContributorCount(item: AnalyzedRepo): number {
+  return item.metrics?.contributors ?? 0;
+}
+
+function tokenizeRepo(item: AnalyzedRepo): Set<string> {
+  return new Set(
+    [
+      item.search.fullName,
+      item.search.name,
+      item.search.description ?? "",
+      getPrimaryLanguage(item),
+    ]
+      .join(" ")
+      .toLowerCase()
+      .replace(/[^\w\s-]/g, " ")
+      .split(/\s+/)
+      .filter(Boolean)
+  );
+}
+
+type PromptProfile = {
+  label: string;
+  strictQualityFloor: boolean;
+  bestFor: Record<RankedShortlistItem["fitType"], string>;
+};
+
+function buildPromptProfile(intent: ParsedIntent): PromptProfile {
+  const intentText = [intent.normalizedQuery, ...intent.displayTerms, ...intent.purposeTerms, ...intent.concepts]
+    .join(" ")
+    .toLowerCase();
+
+  if (/\bmcp\b/.test(intentText) && /\b(agent|coding|code|developer)\b/.test(intentText)) {
+    return {
+      label: "MCP-based coding assistants",
+      strictQualityFloor: true,
+      bestFor: {
+        "direct match": "teams building MCP-based coding assistants",
+        "adaptable framework": "teams wiring an orchestration layer around MCP coding workflows",
+        "production choice": "teams that want a more established MCP/coding integration starting point",
+        "niche option": "teams exploring a narrower MCP workflow or newer coding assistant",
+        "balanced option": "teams that want a practical MCP/coding starting point without a large platform bet",
+      },
+    };
+  }
+
+  if (intent.concepts.includes("monitoring") && intent.concepts.includes("self-hosted")) {
+    return {
+      label: "self-hosted monitoring for APIs and websites",
+      strictQualityFloor: true,
+      bestFor: {
+        "direct match": "teams running self-hosted API and website monitoring",
+        "adaptable framework": "teams that can extend a broader observability tool to their monitoring workflow",
+        "production choice": "teams that prefer a more proven monitoring project over the most targeted match",
+        "niche option": "teams evaluating a narrower or newer self-hosted monitoring option",
+        "balanced option": "teams that want a credible monitoring option without over-optimizing for one metric",
+      },
+    };
+  }
+
+  if (intent.concepts.includes("local-ai") && intent.concepts.includes("desktop-app")) {
+    return {
+      label: "desktop local LLM apps",
+      strictQualityFloor: false,
+      bestFor: {
+        "direct match": "teams building or adopting desktop local LLM apps",
+        "adaptable framework": "teams that can adapt a desktop AI foundation into a local LLM workflow",
+        "production choice": "teams that prefer a more established local AI project",
+        "niche option": "teams exploring a newer or more specialized local AI app",
+        "balanced option": "teams that want a practical local AI app without chasing the largest framework",
+      },
+    };
+  }
+
+  const label = intent.displayTerms[0] ?? "the request";
+  return {
+    label,
+    strictQualityFloor: false,
+    bestFor: {
+      "direct match": `teams that want the closest match to ${label}`,
+      "adaptable framework": `teams that can customize a framework around ${label}`,
+      "production choice": "teams that prefer a more proven and widely adopted repo",
+      "niche option": `teams evaluating a narrower or newer option in ${label}`,
+      "balanced option": "teams looking for a balanced compromise between fit and maturity",
+    },
+  };
+}
+
+function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedShortlistItem[] {
+  const prompt = buildPromptProfile(intent);
+  const scored = results.map((item) => {
+    const tokens = tokenizeRepo(item);
+    const promptFit = intent.purposeTerms.filter((term) => tokens.has(term)).length;
+    const intentText = [intent.normalizedQuery, ...intent.displayTerms, ...intent.purposeTerms, ...intent.concepts]
+      .join(" ")
+      .toLowerCase();
+    const mcpQuery = /\bmcp\b/.test(intentText) && /\b(agent|coding|code|developer)\b/.test(intentText);
+    const repoText = [item.search.fullName, item.search.description ?? "", getPrimaryLanguage(item)].join(" ").toLowerCase();
+    const repoDescriptor =
+      /\borchestrator|workflow\b/.test(repoText)
+        ? "orchestration"
+        : /\bstudio|gui|electron|desktop\b/.test(repoText)
+          ? "ui"
+          : /\bserver\b/.test(repoText)
+            ? "server"
+            : /\bcli\b/.test(repoText)
+              ? "cli"
+              : /\bframework|sdk|platform|toolkit\b/.test(repoText)
+                ? "framework"
+                : "general";
+    const mcpRelevance =
+      mcpQuery
+        ? Number(/\bmcp\b|\bmodel context protocol\b/.test(repoText)) +
+          Number(/\b(agent|assistant|orchestrator|workflow)\b/.test(repoText)) +
+          Number(/\b(code|coding|developer|dev)\b/.test(repoText))
+        : 0;
+    const stars = item.search.stars;
+    const forks = item.search.forks;
+    const contributors = getContributorCount(item);
+    const repoAgeDays = getRepoAgeDays(item);
+    const repoAgeMonths = Math.max(1, repoAgeDays / 30);
+    const starVelocity = stars / repoAgeMonths;
+    const ageDays = Math.floor((Date.now() - getLastCommit(item).getTime()) / (24 * 60 * 60 * 1000));
+    const activityScore = ageDays <= 14 ? 3 : ageDays <= 60 ? 2 : ageDays <= 180 ? 1 : 0;
+    const adoptionScore =
+      stars >= 20_000 || forks >= 3_000
+        ? 4
+        : stars >= 5_000 || forks >= 750
+          ? 3
+          : stars >= 1_000 || forks >= 200 || contributors >= 25
+            ? 2
+            : stars >= 100 || forks >= 25 || contributors >= 5
+              ? 1
+              : 0;
+    const maturityScore =
+      repoAgeDays >= 365 * 2
+        ? 3
+        : repoAgeDays >= 365
+          ? 2
+          : repoAgeDays >= 180
+            ? 1
+            : 0;
+    const velocityScore = starVelocity >= 500 ? 2 : starVelocity >= 100 ? 1 : 0;
+    const maintainabilityScore =
+      item.metrics && !item.error ? (item.metrics.openIssues <= 50 ? 2 : item.metrics.openIssues <= 200 ? 1 : 0) : 0;
+    const frameworkLike = /\b(framework|sdk|library|toolkit|platform|starter)\b/i.test(
+      item.search.description ?? ""
+    );
+
+    const passesQualityFloor = prompt.strictQualityFloor
+      ? ((stars >= 50 && repoAgeDays >= 45 && contributors >= 2) ||
+          (promptFit + mcpRelevance >= 3 && (stars >= 20 || forks >= 5) && repoAgeDays >= 30))
+      : (stars >= 10 || forks >= 2 || contributors >= 2 || repoAgeDays >= 30 || promptFit >= 2);
+
+    if (!passesQualityFloor) {
+      return null;
+    }
+
+    const fitScore = Math.min(
+      3,
+      promptFit + (mcpQuery ? Math.min(2, mcpRelevance) : 0) >= 4
+        ? 3
+        : promptFit + (mcpQuery ? Math.min(2, mcpRelevance) : 0) >= 2
+          ? 2
+          : promptFit >= 1 || mcpRelevance >= 1
+            ? 1
+            : 0
+    );
+    const adoptionRubric =
+      stars >= 25_000 || forks >= 2_500 || contributors >= 100
+        ? 3
+        : stars >= 5_000 || forks >= 500 || contributors >= 25
+          ? 2
+          : stars >= 250 || forks >= 25 || contributors >= 5
+            ? 1
+            : 0;
+    const maintenanceRubric =
+      ageDays <= 30
+        ? 2
+        : ageDays <= 120
+          ? 1
+          : 0;
+    const maturityRubric =
+      repoAgeDays >= 365 * 2
+        ? 2
+        : repoAgeDays >= 180
+          ? 1
+          : 0;
+    const bonusRubric = Math.min(1, maintainabilityScore > 0 || velocityScore > 0 ? 1 : 0);
+
+    const fitType: RankedShortlistItem["fitType"] =
+      fitScore >= 2
+        ? "direct match"
+        : frameworkLike
+          ? "adaptable framework"
+          : stars >= 5_000
+            ? "production choice"
+            : stars < 500
+              ? "niche option"
+              : "balanced option";
+
+    const descriptorBonus =
+      mcpQuery
+        ? repoDescriptor === "server"
+          ? 0.75
+          : repoDescriptor === "orchestration"
+            ? 0.5
+            : repoDescriptor === "framework"
+              ? 0.25
+              : 0
+        : 0;
+
+    const weightedScore = fitScore + adoptionRubric + maintenanceRubric + maturityRubric + bonusRubric + descriptorBonus;
+
+    const whyParts: string[] = [];
+    if (fitScore >= 3) whyParts.push(`most direct fit for ${prompt.label}`);
+    else if (fitType === "adaptable framework") whyParts.push("adaptable foundation for this workflow");
+    else if (fitType === "production choice") whyParts.push("maturity and adoption are stronger than the rest of the field");
+    else if (fitType === "niche option") whyParts.push("specialized option that matches part of the prompt");
+    else if (descriptorBonus > 0) whyParts.push(`${repoDescriptor} shape matches the workflow`);
+    if (adoptionRubric >= 2) whyParts.push("strong adoption");
+    if (maturityRubric >= 1) whyParts.push("established repo age");
+    if (maintenanceRubric >= 1) whyParts.push("recent maintenance");
+    if (mcpQuery && mcpRelevance >= 2) whyParts.push("clear MCP/coding relevance");
+
+    let tradeoff: string | null = null;
+    if (fitType === "adaptable framework") tradeoff = "more setup required than a purpose-built tool";
+    else if (fitType === "production choice") tradeoff = "broader scope than the most targeted option";
+    else if (fitType === "niche option") tradeoff = "lower adoption signal than the top picks";
+    else if (repoAgeDays < 180) tradeoff = "project is still relatively new";
+    else if (fitScore < 2) tradeoff = "fit is broader than the exact prompt";
+
+    let bestFor = prompt.bestFor[fitType];
+    if (mcpQuery) {
+      if (repoDescriptor === "server") {
+        bestFor = "teams integrating a lightweight MCP server into coding workflows";
+      } else if (repoDescriptor === "orchestration") {
+        bestFor = "teams orchestrating multi-agent coding workflows around MCP";
+      } else if (repoDescriptor === "ui") {
+        bestFor = "teams exploring a UI-first coding assistant environment";
+      } else if (repoDescriptor === "framework") {
+        bestFor = "teams building a broader coding-agent platform with MCP support";
+      }
+    }
+
+    return {
+      item,
+      score: Math.max(1, Math.min(10, Math.round(weightedScore))),
+      why: whyParts.join("; "),
+      tradeoff,
+      bestFor,
+      fitType,
+    };
+  }).filter(Boolean) as RankedShortlistItem[];
+
+  const ranked: RankedShortlistItem[] = [];
+  const seenTypes = new Set<string>();
+  const pool = [...scored];
+
+  while (pool.length > 0) {
+    pool.sort((a, b) => {
+      const aPenalty = seenTypes.has(a.fitType) ? 1.25 : 0;
+      const bPenalty = seenTypes.has(b.fitType) ? 1.25 : 0;
+      return b.score - bPenalty - (a.score - aPenalty);
+    });
+    const next = pool.shift();
+    if (!next) break;
+    ranked.push(next);
+    seenTypes.add(next.fitType);
+  }
+
+  return ranked;
+}
+
+function buildCaution(item: AnalyzedRepo): string | null {
+  const ageDays = Math.floor((Date.now() - getLastCommit(item).getTime()) / (24 * 60 * 60 * 1000));
+
+  if (item.error) {
+    return `analysis failed: ${item.error}`;
+  }
+  if (item.metrics && item.metrics.openIssues > 300) {
+    return "high issue load";
+  }
+  if (ageDays > 180) {
+    return "not recently active";
+  }
+  if (item.search.stars < 25) {
+    return "low adoption signal";
+  }
+
+  return null;
+}
+
+function buildShortlistNames(results: Array<AnalyzedRepo | RankedShortlistItem>): string {
+  const unwrap = (entry: AnalyzedRepo | RankedShortlistItem) => ("item" in entry ? entry.item : entry);
   const successful = results
+    .map(unwrap)
     .filter((item) => !item.error)
     .slice(0, 3)
     .map((item) => item.search.fullName);
@@ -344,28 +527,31 @@ function buildShortlistNames(results: AnalyzedRepo[]): string {
   }
 
   return results
+    .map(unwrap)
     .slice(0, 3)
     .map((item) => item.search.fullName)
     .join(", ");
 }
 
-async function writeScoutReport(results: AnalyzedRepo[], summary: string): Promise<void> {
+async function writeScoutReport(results: RankedShortlistItem[], summary: string): Promise<void> {
   await mkdir("reports", { recursive: true });
 
   const timestamp = new Date().toISOString();
   const header = `# Repo Scout Results\n\nGenerated: ${timestamp}\n`;
   const tableHeader = [
-    "| Repo | Stars | Language | Last Commit | Why Recommended | Score (1-10) |",
-    "| --- | ---: | --- | --- | --- | ---: |",
+    "| Repo | Score | Best For | Why Recommended | Tradeoff | Stars | Forks | Contributors | Age | Language | Last Commit |",
+    "| --- | ---: | --- | --- | --- | ---: | ---: | ---: | --- | --- | --- |",
   ];
-  const rows = results.map((item) => {
+  const rows = results.map((ranked) => {
+    const { item } = ranked;
     const repo = item.search.fullName;
     const stars = item.search.stars.toLocaleString();
+    const forks = item.search.forks.toLocaleString();
+    const contributors = getContributorCount(item).toLocaleString();
+    const age = getRepoAgeLabel(item);
     const language = getPrimaryLanguage(item);
     const lastCommit = getLastCommit(item).toISOString().slice(0, 10);
-    const why = item.error ? `Analysis failed: ${item.error}` : buildRecommendationReason(item);
-    const score = computeScore(item);
-    return `| ${repo} | ${stars} | ${language} | ${lastCommit} | ${why} | ${score} |`;
+    return `| ${repo} | ${ranked.score} | ${ranked.bestFor} | ${ranked.why} | ${ranked.tradeoff ?? "—"} | ${stars} | ${forks} | ${contributors} | ${age} | ${language} | ${lastCommit} |`;
   });
 
   const content = [
@@ -384,9 +570,31 @@ async function writeScoutReport(results: AnalyzedRepo[], summary: string): Promi
   await writeFile("reports/REPO_SCOUT_RESULTS.md", content, "utf8");
 }
 
-function renderShortlist(results: AnalyzedRepo[]): string {
+function renderShortlist(results: RankedShortlistItem[]): string {
   return results
-    .map((item, index) => `${index + 1}. ${item.search.fullName}`)
+    .map((ranked, index) => {
+      const { item } = ranked;
+      const caution = buildCaution(item);
+      const stars = item.search.stars.toLocaleString();
+      const forks = item.search.forks.toLocaleString();
+      const contributors = getContributorCount(item).toLocaleString();
+      const age = getRepoAgeLabel(item);
+      const lastCommit = getLastCommit(item).toISOString().slice(0, 10);
+      const language = getPrimaryLanguage(item);
+      const lines = [
+        `${index + 1}. ${item.search.fullName}`,
+        `   Score: ${ranked.score}/10`,
+        `   Best for: ${ranked.bestFor}`,
+        `   Why: ${ranked.why}`,
+        ranked.tradeoff ? `   Tradeoff: ${ranked.tradeoff}` : null,
+        caution ? `   Caution: ${caution}` : null,
+        `   Stars: ${stars} | Forks: ${forks} | Contributors: ${contributors}`,
+        `   Age: ${age} | Last push: ${lastCommit} | Language: ${language}`,
+        `   ${buildRepoUrl(item.search.fullName)}`,
+      ].filter(Boolean);
+
+      return lines.join("\n");
+    })
     .join("\n");
 }
 
@@ -526,7 +734,7 @@ async function loadScoutSelectionContext(
 
     for (const line of lines) {
       if (!line.startsWith("|")) continue;
-      if (line.includes("Repo | Stars | Language")) continue;
+      if (line.includes("Repo | Score | Best For")) continue;
       if (line.includes("---")) continue;
 
       const columns = line
@@ -534,12 +742,12 @@ async function loadScoutSelectionContext(
         .slice(1, -1)
         .map((part) => part.trim());
 
-      if (columns.length < 6) continue;
+      if (columns.length < 8) continue;
       if (columns[0] !== repoFullName) continue;
 
-      const score = Number(columns[5]);
+      const score = Number(columns[1]);
       return {
-        whyRecommended: columns[4],
+        whyRecommended: columns[3],
         score: Number.isNaN(score) ? null : score,
       };
     }
@@ -875,12 +1083,47 @@ async function main() {
 
       const inferred = inferFilters(userInput, plan.search);
       const effectiveSearch = inferred.search;
+      const { intent } = inferred;
+
+      if (shouldClarifyBeforeSearch(intent)) {
+        const filterText = renderAppliedFilters(inferred.applied);
+        if (filterText) {
+          output.write(`${filterText}\n`);
+        }
+        const response = buildClarificationPrompt(intent);
+        output.write(`${response}\n`);
+        history.push({ role: "assistant", content: response });
+        continue;
+      }
+
       output.write("Searching GitHub...\n");
       const query = buildGitHubQuery(effectiveSearch);
       let results = await githubAdapter.searchRepos(query, effectiveSearch.sort, 100);
       if (results.length === 0) {
+        if (intent.confidence < 0.4) {
+          const filterText = renderAppliedFilters(inferred.applied);
+          if (filterText) {
+            output.write(`${filterText}\n`);
+          }
+          const response =
+            "I am not confident I interpreted that request correctly. Try naming the product type, language, or license you care about most.";
+          output.write(`${response}\n`);
+          history.push({ role: "assistant", content: response });
+          continue;
+        }
+
+        const broaderQuery = buildBroaderSearchQuery(intent);
+        if (broaderQuery && broaderQuery !== effectiveSearch.query) {
+          output.write(`Retrying with broader query: ${broaderQuery}\n`);
+          results = await githubAdapter.searchRepos(
+            buildGitHubQuery({ ...effectiveSearch, query: broaderQuery }),
+            effectiveSearch.sort,
+            100
+          );
+        }
+
         const relaxedQuery = normalizeSearchQuery(effectiveSearch.query);
-        if (relaxedQuery && relaxedQuery !== effectiveSearch.query) {
+        if (results.length === 0 && relaxedQuery && relaxedQuery !== effectiveSearch.query) {
           output.write(`Retrying with broader query: ${relaxedQuery}\n`);
           results = await githubAdapter.searchRepos(
             buildGitHubQuery({ ...effectiveSearch, query: relaxedQuery }),
@@ -888,14 +1131,39 @@ async function main() {
             100
           );
         }
+
+        if (results.length === 0) {
+          const fallbackQuery = broaderQuery ?? relaxedQuery ?? effectiveSearch.query;
+          const relaxedSearch = {
+            ...effectiveSearch,
+            query: fallbackQuery,
+            since: null,
+            license: null,
+            minStars: 0,
+            sort: "stars" as const,
+          };
+          output.write(`Retrying with relaxed filters: ${fallbackQuery}\n`);
+          results = await githubAdapter.searchRepos(
+            buildGitHubQuery(relaxedSearch),
+            relaxedSearch.sort,
+            100
+          );
+        }
       }
       results = results.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
       const picked = pickResults(results, plan.search.top, plan.search.random);
+      const hadCandidates = picked.length > 0;
 
       output.write("Analyzing results...\n");
       const analyzed = await analyzePickedRepos(analyzeRepo, picked);
-      const response = await brain.respond(history, userInput, effectiveSearch, analyzed);
-      await writeScoutReport(analyzed, response);
+      const response =
+        analyzed.length === 0
+          ? intent.confidence < 0.4
+            ? "I still do not have a confident read on that request. Try specifying the repo category, stack, or deployment style."
+            : hadCandidates
+              ? "I did not find perfect matches, but I found a few plausible repos worth checking."
+            : "I did not find strong matches for that query. Try narrowing by framework, language, stars, or maintenance level."
+          : await brain.respond(history, userInput, effectiveSearch, analyzed);
       const filterText = renderAppliedFilters(inferred.applied);
       if (filterText) {
         output.write(`${filterText}\n`);
@@ -903,14 +1171,19 @@ async function main() {
       output.write(`${response}\n`);
       history.push({ role: "assistant", content: response });
 
-      if (analyzed.length === 0) {
+      if (analyzed.length === 0 && !hadCandidates) {
         continue;
       }
 
-      output.write(`${renderShortlist(analyzed)}\n`);
+      const shortlist = rankShortlist(
+        analyzed.length > 0 ? analyzed : picked.map((search) => ({ search, metrics: null, error: null })),
+        intent
+      );
+      await writeScoutReport(shortlist, response);
+      output.write(`${renderShortlist(shortlist)}\n`);
 
       shortlist: while (true) {
-        const selection = await promptForSelection(rl, analyzed.length);
+        const selection = await promptForSelection(rl, shortlist.length);
 
         if (selection.kind === "exit") {
           return;
@@ -921,10 +1194,10 @@ async function main() {
         }
 
         if (selection.kind === "none") {
-          analyzed.forEach((item) => rejectedRepos.add(item.search.fullName));
+          shortlist.forEach((ranked) => rejectedRepos.add(ranked.item.search.fullName));
           history.push({
             role: "assistant",
-            content: `Previous Search (rejected): ${buildShortlistNames(analyzed)}`,
+            content: `Previous Search (rejected): ${buildShortlistNames(shortlist)}`,
           });
 
           while (true) {
@@ -941,7 +1214,7 @@ async function main() {
           }
         }
 
-        const chosen = analyzed[selection.index].search;
+        const chosen = shortlist[selection.index].item.search;
         output.write(`Running in-depth analysis for ${chosen.fullName}...\n`);
         const repoContext = await buildRepoContext(githubAdapter, analyzeRepo, chosen);
         await writeAnalysisReport(repoContext);

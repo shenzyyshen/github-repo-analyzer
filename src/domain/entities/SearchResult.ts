@@ -8,7 +8,9 @@ export interface SearchResult {
   fullName: string;
   description: string | null;
   stars: number;
+  forks: number;
   language: string | null;
+  createdAt: Date;
   pushedAt: Date;
   topics: string[];
 }

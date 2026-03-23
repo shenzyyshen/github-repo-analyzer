@@ -11,25 +11,47 @@ Example prompt:
 
 ---
 
-## Current Capabilities
-- **AI-assisted search**: free-text prompt → AI → GitHub search query  
-- **CLI workflow**: search and analyze repos directly in the terminal  
-- **Analysis + persistence**: each repo analyzed is stored in Postgres  
-- **REST API**: for programmatic access and future GUI integration  
-- **MCP server**: exposes tools for AI clients  
-- **Hexagonal architecture**: domain core is isolated from adapters
+## Core Features
+- **Natural-language repository discovery**: describe what you want in plain English instead of writing GitHub qualifiers manually
+- **Conversational terminal interface**: run `npm run repo` and interactively search, refine, shortlist, and analyze repos
+- **AI-assisted intent parsing**: extract signals like language, activity, license, maturity, and product type from user prompts
+- **Concept-aware search broadening**: retry with broader domain terms when the first GitHub query is too narrow
+- **Shortlist ranking with rationale**: rank repos by prompt fit, adoption, maturity, maintenance, and quality-floor filters
+- **Decision-ready shortlist output**: each candidate includes score, best use case, rationale, tradeoff, caution, stars, forks, contributors, age, language, and GitHub link
+- **Deep repo analysis**: select a repo from the shortlist and generate a deeper markdown report in `reports/REPO_ANALYSIS.md`
+- **Saved scout report**: each shortlist run writes `reports/REPO_SCOUT_RESULTS.md`
+- **CLI fallback behavior**: if AI query translation is unavailable, the tool falls back to raw GitHub search instead of failing
+- **REST API + MCP support**: same core capabilities can be exposed to programmatic clients and AI tooling
+- **Hexagonal architecture**: domain logic stays isolated from GitHub, database, and transport adapters
 
 ---
 
-## Flow (High Level)
-1. User submits a natural-language query.  
-2. AI translates it into a GitHub search query.  
-3. GitHub API is queried for matching repos.  
-4. Top results are analyzed and returned.
+## Interactive Workflow
+1. User starts the conversational scout with `npm run repo`.
+2. User enters a natural-language prompt such as:
+   - `I want an open source self-hosted tool for monitoring APIs and websites`
+3. The agent parses intent and extracts useful filters such as:
+   - language
+   - license
+   - activity
+   - product category
+   - maturity signals
+4. The system queries GitHub, broadens the search if needed, and analyzes the top candidates.
+5. The user sees a ranked shortlist with:
+   - score
+   - best use case
+   - why it ranked there
+   - tradeoffs and cautions
+   - repo metrics and GitHub link
+6. The user can then:
+   - pick a repo for deeper analysis
+   - refine the shortlist
+   - go back
+   - open a repo in the browser
 
 ---
 
-## CLI Usage (Primary Interface)
+## CLI Usage
 ```bash
 npm run cli -- search "<query>" [options]
 ```
@@ -48,6 +70,25 @@ Examples:
 npm run cli -- search "linux environment setup" --language shell --min-stars 500
 npm run cli -- search "websocket" --random
 npm run cli -- search "llm inference" --sort updated --top 3
+```
+
+## Conversational Agent
+Primary interactive entry point:
+
+```bash
+npm run repo
+```
+
+You can then type prompts like:
+
+```text
+I want an open source self-hosted tool for monitoring APIs and websites
+```
+
+or:
+
+```text
+mcp agents for ai and coding tasks
 ```
 
 ---
@@ -112,7 +153,16 @@ npm run dev
 ---
 
 ## Architecture
-This project uses **Hexagonal (Ports & Adapters)** architecture. Domain logic is in `src/domain/`, ports in `src/ports/`, and adapters in `src/adapters/`.  
+This project uses **Hexagonal (Ports & Adapters)** architecture.
+
+- `src/domain/` contains core entities and use cases
+- `src/ports/` defines the interfaces the domain depends on
+- `src/adapters/` implements GitHub and database access
+- `src/cli/` contains the direct CLI commands, conversational agent, and intent parser
+- `src/server/` exposes the same core logic through API and MCP surfaces
+
+This keeps the product logic separate from infrastructure details and makes search, ranking, analysis, and transport layers easier to evolve independently.
+
 See:
 - `ARCHITECTURE.md`
 - `docs/IMPLEMENTATION-AND-GUI.md`
@@ -120,19 +170,21 @@ See:
 
 ---
 
-## Roadmap (Planned)
-**Search + discovery**
-- Smart ranking (composite score)
-- Search history + saved results
-- Interactive CLI selection
+## Roadmap
+**Short-term**
+- Better external repo analysis from GitHub README + root contents
+- Stronger prompt-specific ranking and rationale generation
+- Session persistence for the conversational scout
 
-**GitHub integration**
-- OAuth device flow
-- Ability to star repos from the CLI
+**Medium-term**
+- Search history and saved results
+- GitHub OAuth and user-linked actions
+- Compare mode for shortlisted repos
 
-**UI**
-- CLI-first (current)
-- GUI later (React or Next.js)
+**Long-term**
+- Web UI on top of the same API/domain layer
+- Richer analytics and trend tracking
+- More advanced external repo quality analysis
 
 ---
 
