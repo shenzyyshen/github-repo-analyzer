@@ -104,7 +104,9 @@ export class GithubAdapter implements RepoApiPort {
       fullName: item.full_name,
       description: item.description ?? null,
       stars: item.stargazers_count ?? 0,
+      forks: item.forks_count ?? 0,
       language: item.language ?? null,
+      createdAt: new Date(item.created_at ?? Date.now()),
       pushedAt: new Date(item.pushed_at ?? Date.now()),
       topics: item.topics ?? [],
     }));
