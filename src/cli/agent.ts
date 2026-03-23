@@ -11,9 +11,11 @@ import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { Metrics } from "../domain/entities/Metrics.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
 import {
+  buildBroaderSearchQuery,
   buildClarificationPrompt,
   inferFilters,
   normalizeSearchQuery,
+  type ParsedIntent,
   renderAppliedFilters,
   shouldClarifyBeforeSearch,
 } from "./intent.js";
@@ -67,6 +69,15 @@ type AnalyzedRepo = {
   search: SearchResult;
   metrics: Metrics | null;
   error: string | null;
+};
+
+type RankedShortlistItem = {
+  item: AnalyzedRepo;
+  score: number;
+  bestFor: string;
+  why: string;
+  tradeoff: string | null;
+  fitType: "direct match" | "production choice" | "adaptable framework" | "niche option" | "balanced option";
 };
 
 type SelectionChoice =
@@ -192,8 +203,180 @@ function computeScore(item: AnalyzedRepo): number {
   return Math.max(1, Math.min(10, Math.round(starsScore + recencyScore + issueScore)));
 }
 
-function buildShortlistNames(results: AnalyzedRepo[]): string {
+function buildRepoUrl(fullName: string): string {
+  return `https://github.com/${fullName}`;
+}
+
+function getRepoAgeDays(item: AnalyzedRepo): number {
+  return Math.max(
+    1,
+    Math.floor((Date.now() - item.search.createdAt.getTime()) / (24 * 60 * 60 * 1000))
+  );
+}
+
+function getRepoAgeLabel(item: AnalyzedRepo): string {
+  const days = getRepoAgeDays(item);
+  if (days < 30) return `${days}d`;
+  const months = Math.floor(days / 30);
+  if (months < 24) return `${months}mo`;
+  return `${Math.floor(months / 12)}y`;
+}
+
+function getContributorCount(item: AnalyzedRepo): number {
+  return item.metrics?.contributors ?? 0;
+}
+
+function tokenizeRepo(item: AnalyzedRepo): Set<string> {
+  return new Set(
+    [
+      item.search.fullName,
+      item.search.name,
+      item.search.description ?? "",
+      getPrimaryLanguage(item),
+    ]
+      .join(" ")
+      .toLowerCase()
+      .replace(/[^\w\s-]/g, " ")
+      .split(/\s+/)
+      .filter(Boolean)
+  );
+}
+
+function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedShortlistItem[] {
+  const promptLabel = intent.displayTerms[0] ?? "the request";
+  const scored = results.map((item) => {
+    const tokens = tokenizeRepo(item);
+    const promptFit = intent.purposeTerms.filter((term) => tokens.has(term)).length;
+    const stars = item.search.stars;
+    const forks = item.search.forks;
+    const contributors = getContributorCount(item);
+    const repoAgeDays = getRepoAgeDays(item);
+    const repoAgeMonths = Math.max(1, repoAgeDays / 30);
+    const starVelocity = stars / repoAgeMonths;
+    const ageDays = Math.floor((Date.now() - getLastCommit(item).getTime()) / (24 * 60 * 60 * 1000));
+    const activityScore = ageDays <= 14 ? 3 : ageDays <= 60 ? 2 : ageDays <= 180 ? 1 : 0;
+    const adoptionScore =
+      stars >= 20_000 || forks >= 3_000
+        ? 4
+        : stars >= 5_000 || forks >= 750
+          ? 3
+          : stars >= 1_000 || forks >= 200 || contributors >= 25
+            ? 2
+            : stars >= 100 || forks >= 25 || contributors >= 5
+              ? 1
+              : 0;
+    const maturityScore =
+      repoAgeDays >= 365 * 2
+        ? 3
+        : repoAgeDays >= 365
+          ? 2
+          : repoAgeDays >= 180
+            ? 1
+            : 0;
+    const velocityScore = starVelocity >= 500 ? 2 : starVelocity >= 100 ? 1 : 0;
+    const maintainabilityScore =
+      item.metrics && !item.error ? (item.metrics.openIssues <= 50 ? 2 : item.metrics.openIssues <= 200 ? 1 : 0) : 0;
+    const frameworkLike = /\b(framework|sdk|library|toolkit|platform|starter)\b/i.test(
+      item.search.description ?? ""
+    );
+
+    const fitType: RankedShortlistItem["fitType"] =
+      promptFit >= 2
+        ? "direct match"
+        : frameworkLike
+          ? "adaptable framework"
+          : stars >= 5_000
+            ? "production choice"
+            : stars < 500
+              ? "niche option"
+              : "balanced option";
+
+    const weightedScore =
+      promptFit * 3 +
+      adoptionScore * 2 +
+      maturityScore * 1.5 +
+      activityScore * 1.25 +
+      maintainabilityScore +
+      velocityScore;
+
+    const whyParts: string[] = [];
+    if (promptFit >= 2) whyParts.push(`closest fit for ${promptLabel}`);
+    else if (fitType === "adaptable framework") whyParts.push("flexible base you can adapt to the use case");
+    else if (fitType === "production choice") whyParts.push("strong adoption and maturity signal");
+    else if (fitType === "niche option") whyParts.push("more specialized option for the prompt");
+    else whyParts.push("balanced tradeoff between fit and maturity");
+    if (adoptionScore >= 3) whyParts.push("strong adoption signal");
+    if (maturityScore >= 2) whyParts.push("project looks established");
+    if (activityScore >= 2) whyParts.push("active maintenance");
+    if (maintainabilityScore >= 1) whyParts.push("issue load looks manageable");
+    if (velocityScore >= 1) whyParts.push("good growth relative to repo age");
+
+    let tradeoff: string | null = null;
+    if (fitType === "adaptable framework") tradeoff = "more setup required than a purpose-built tool";
+    else if (fitType === "production choice") tradeoff = "broader scope than the most targeted option";
+    else if (fitType === "niche option") tradeoff = "lower adoption signal than the top picks";
+    else if (repoAgeDays < 180) tradeoff = "project is still relatively new";
+    else if (promptFit < 2) tradeoff = "fit is broader than the exact prompt";
+
+    let bestFor = "";
+    if (fitType === "direct match") bestFor = `teams that want a direct ${promptLabel} solution`;
+    else if (fitType === "adaptable framework") bestFor = `teams willing to customize a framework for ${promptLabel}`;
+    else if (fitType === "production choice") bestFor = "teams prioritizing maturity and adoption";
+    else if (fitType === "niche option") bestFor = `teams exploring a focused ${promptLabel} option`;
+    else bestFor = "teams balancing fit, maturity, and ease of evaluation";
+
+    return {
+      item,
+      score: Math.max(1, Math.min(10, Math.round(weightedScore))),
+      why: whyParts.join("; "),
+      tradeoff,
+      bestFor,
+      fitType,
+    };
+  });
+
+  const ranked: RankedShortlistItem[] = [];
+  const seenTypes = new Set<string>();
+  const pool = [...scored];
+
+  while (pool.length > 0) {
+    pool.sort((a, b) => {
+      const aPenalty = seenTypes.has(a.fitType) ? 1.25 : 0;
+      const bPenalty = seenTypes.has(b.fitType) ? 1.25 : 0;
+      return b.score - bPenalty - (a.score - aPenalty);
+    });
+    const next = pool.shift();
+    if (!next) break;
+    ranked.push(next);
+    seenTypes.add(next.fitType);
+  }
+
+  return ranked;
+}
+
+function buildCaution(item: AnalyzedRepo): string | null {
+  const ageDays = Math.floor((Date.now() - getLastCommit(item).getTime()) / (24 * 60 * 60 * 1000));
+
+  if (item.error) {
+    return `analysis failed: ${item.error}`;
+  }
+  if (item.metrics && item.metrics.openIssues > 300) {
+    return "high issue load";
+  }
+  if (ageDays > 180) {
+    return "not recently active";
+  }
+  if (item.search.stars < 100) {
+    return "low adoption signal";
+  }
+
+  return null;
+}
+
+function buildShortlistNames(results: Array<AnalyzedRepo | RankedShortlistItem>): string {
+  const unwrap = (entry: AnalyzedRepo | RankedShortlistItem) => ("item" in entry ? entry.item : entry);
   const successful = results
+    .map(unwrap)
     .filter((item) => !item.error)
     .slice(0, 3)
     .map((item) => item.search.fullName);
@@ -203,28 +386,31 @@ function buildShortlistNames(results: AnalyzedRepo[]): string {
   }
 
   return results
+    .map(unwrap)
     .slice(0, 3)
     .map((item) => item.search.fullName)
     .join(", ");
 }
 
-async function writeScoutReport(results: AnalyzedRepo[], summary: string): Promise<void> {
+async function writeScoutReport(results: RankedShortlistItem[], summary: string): Promise<void> {
   await mkdir("reports", { recursive: true });
 
   const timestamp = new Date().toISOString();
   const header = `# Repo Scout Results\n\nGenerated: ${timestamp}\n`;
   const tableHeader = [
-    "| Repo | Stars | Language | Last Commit | Why Recommended | Score (1-10) |",
-    "| --- | ---: | --- | --- | --- | ---: |",
+    "| Repo | Score | Best For | Why Recommended | Tradeoff | Stars | Forks | Contributors | Age | Language | Last Commit |",
+    "| --- | ---: | --- | --- | --- | ---: | ---: | ---: | --- | --- | --- |",
   ];
-  const rows = results.map((item) => {
+  const rows = results.map((ranked) => {
+    const { item } = ranked;
     const repo = item.search.fullName;
     const stars = item.search.stars.toLocaleString();
+    const forks = item.search.forks.toLocaleString();
+    const contributors = getContributorCount(item).toLocaleString();
+    const age = getRepoAgeLabel(item);
     const language = getPrimaryLanguage(item);
     const lastCommit = getLastCommit(item).toISOString().slice(0, 10);
-    const why = item.error ? `Analysis failed: ${item.error}` : buildRecommendationReason(item);
-    const score = computeScore(item);
-    return `| ${repo} | ${stars} | ${language} | ${lastCommit} | ${why} | ${score} |`;
+    return `| ${repo} | ${ranked.score} | ${ranked.bestFor} | ${ranked.why} | ${ranked.tradeoff ?? "—"} | ${stars} | ${forks} | ${contributors} | ${age} | ${language} | ${lastCommit} |`;
   });
 
   const content = [
@@ -243,9 +429,31 @@ async function writeScoutReport(results: AnalyzedRepo[], summary: string): Promi
   await writeFile("reports/REPO_SCOUT_RESULTS.md", content, "utf8");
 }
 
-function renderShortlist(results: AnalyzedRepo[]): string {
+function renderShortlist(results: RankedShortlistItem[]): string {
   return results
-    .map((item, index) => `${index + 1}. ${item.search.fullName}`)
+    .map((ranked, index) => {
+      const { item } = ranked;
+      const caution = buildCaution(item);
+      const stars = item.search.stars.toLocaleString();
+      const forks = item.search.forks.toLocaleString();
+      const contributors = getContributorCount(item).toLocaleString();
+      const age = getRepoAgeLabel(item);
+      const lastCommit = getLastCommit(item).toISOString().slice(0, 10);
+      const language = getPrimaryLanguage(item);
+      const lines = [
+        `${index + 1}. ${item.search.fullName}`,
+        `   Score: ${ranked.score}/10`,
+        `   Best for: ${ranked.bestFor}`,
+        `   Why: ${ranked.why}`,
+        `   Tradeoff: ${ranked.tradeoff ?? "minimal known downside from the current snapshot"}`,
+        caution ? `   Caution: ${caution}` : null,
+        `   Stars: ${stars} | Forks: ${forks} | Contributors: ${contributors}`,
+        `   Age: ${age} | Last push: ${lastCommit} | Language: ${language}`,
+        `   ${buildRepoUrl(item.search.fullName)}`,
+      ].filter(Boolean);
+
+      return lines.join("\n");
+    })
     .join("\n");
 }
 
@@ -385,7 +593,7 @@ async function loadScoutSelectionContext(
 
     for (const line of lines) {
       if (!line.startsWith("|")) continue;
-      if (line.includes("Repo | Stars | Language")) continue;
+      if (line.includes("Repo | Score | Best For")) continue;
       if (line.includes("---")) continue;
 
       const columns = line
@@ -393,12 +601,12 @@ async function loadScoutSelectionContext(
         .slice(1, -1)
         .map((part) => part.trim());
 
-      if (columns.length < 6) continue;
+      if (columns.length < 8) continue;
       if (columns[0] !== repoFullName) continue;
 
-      const score = Number(columns[5]);
+      const score = Number(columns[1]);
       return {
-        whyRecommended: columns[4],
+        whyRecommended: columns[3],
         score: Number.isNaN(score) ? null : score,
       };
     }
@@ -763,8 +971,18 @@ async function main() {
           continue;
         }
 
+        const broaderQuery = buildBroaderSearchQuery(intent);
+        if (broaderQuery && broaderQuery !== effectiveSearch.query) {
+          output.write(`Retrying with broader query: ${broaderQuery}\n`);
+          results = await githubAdapter.searchRepos(
+            buildGitHubQuery({ ...effectiveSearch, query: broaderQuery }),
+            effectiveSearch.sort,
+            100
+          );
+        }
+
         const relaxedQuery = normalizeSearchQuery(effectiveSearch.query);
-        if (relaxedQuery && relaxedQuery !== effectiveSearch.query) {
+        if (results.length === 0 && relaxedQuery && relaxedQuery !== effectiveSearch.query) {
           output.write(`Retrying with broader query: ${relaxedQuery}\n`);
           results = await githubAdapter.searchRepos(
             buildGitHubQuery({ ...effectiveSearch, query: relaxedQuery }),
@@ -772,9 +990,28 @@ async function main() {
             100
           );
         }
+
+        if (results.length === 0) {
+          const fallbackQuery = broaderQuery ?? relaxedQuery ?? effectiveSearch.query;
+          const relaxedSearch = {
+            ...effectiveSearch,
+            query: fallbackQuery,
+            since: null,
+            license: null,
+            minStars: 0,
+            sort: "stars" as const,
+          };
+          output.write(`Retrying with relaxed filters: ${fallbackQuery}\n`);
+          results = await githubAdapter.searchRepos(
+            buildGitHubQuery(relaxedSearch),
+            relaxedSearch.sort,
+            100
+          );
+        }
       }
       results = results.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
       const picked = pickResults(results, plan.search.top, plan.search.random);
+      const hadCandidates = picked.length > 0;
 
       output.write("Analyzing results...\n");
       const analyzed = await analyzePickedRepos(analyzeRepo, picked);
@@ -782,9 +1019,10 @@ async function main() {
         analyzed.length === 0
           ? intent.confidence < 0.4
             ? "I still do not have a confident read on that request. Try specifying the repo category, stack, or deployment style."
+            : hadCandidates
+              ? "I did not find perfect matches, but I found a few plausible repos worth checking."
             : "I did not find strong matches for that query. Try narrowing by framework, language, stars, or maintenance level."
           : await brain.respond(history, userInput, effectiveSearch, analyzed);
-      await writeScoutReport(analyzed, response);
       const filterText = renderAppliedFilters(inferred.applied);
       if (filterText) {
         output.write(`${filterText}\n`);
@@ -792,14 +1030,19 @@ async function main() {
       output.write(`${response}\n`);
       history.push({ role: "assistant", content: response });
 
-      if (analyzed.length === 0) {
+      if (analyzed.length === 0 && !hadCandidates) {
         continue;
       }
 
-      output.write(`${renderShortlist(analyzed)}\n`);
+      const shortlist = rankShortlist(
+        analyzed.length > 0 ? analyzed : picked.map((search) => ({ search, metrics: null, error: null })),
+        intent
+      );
+      await writeScoutReport(shortlist, response);
+      output.write(`${renderShortlist(shortlist)}\n`);
 
       shortlist: while (true) {
-        const selection = await promptForSelection(rl, analyzed.length);
+        const selection = await promptForSelection(rl, shortlist.length);
 
         if (selection.kind === "exit") {
           return;
@@ -810,10 +1053,10 @@ async function main() {
         }
 
         if (selection.kind === "none") {
-          analyzed.forEach((item) => rejectedRepos.add(item.search.fullName));
+          shortlist.forEach((ranked) => rejectedRepos.add(ranked.item.search.fullName));
           history.push({
             role: "assistant",
-            content: `Previous Search (rejected): ${buildShortlistNames(analyzed)}`,
+            content: `Previous Search (rejected): ${buildShortlistNames(shortlist)}`,
           });
 
           while (true) {
@@ -830,7 +1073,7 @@ async function main() {
           }
         }
 
-        const chosen = analyzed[selection.index].search;
+        const chosen = shortlist[selection.index].item.search;
         output.write(`Running in-depth analysis for ${chosen.fullName}...\n`);
         const repoContext = await buildRepoContext(githubAdapter, analyzeRepo, chosen);
         await writeAnalysisReport(repoContext);
