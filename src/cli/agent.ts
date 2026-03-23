@@ -3,6 +3,7 @@ import "dotenv/config";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { spawn } from "node:child_process";
 import OpenAI from "openai";
 import { PrismaClient } from "@prisma/client";
 import { GithubAdapter } from "../adapters/github/GithubAdapter.js";
@@ -64,16 +65,68 @@ type AnalyzedRepo = {
 
 type SelectionChoice =
   | { kind: "pick"; index: number }
+  | { kind: "open"; index: number }
   | { kind: "none" }
   | { kind: "back" }
   | { kind: "exit" };
 
 type TextChoice =
   | { kind: "text"; value: string }
+  | { kind: "open" }
   | { kind: "back" }
   | { kind: "exit" };
 
-const INVALID_SELECTION_MESSAGE = "Enter a number between 1-5, or type 'none' / 'quit'.";
+const INVALID_SELECTION_MESSAGE =
+  "Enter a number between 1-5, `open <number>`, or type 'none' / 'quit'.";
+const STOP_WORDS = new Set([
+  "find",
+  "top",
+  "best",
+  "repos",
+  "repo",
+  "repositories",
+  "projects",
+  "project",
+  "for",
+  "building",
+  "build",
+  "with",
+  "using",
+  "that",
+  "a",
+  "an",
+  "the",
+  "in",
+  "to",
+  "i",
+  "want",
+  "need",
+  "looking",
+  "look",
+  "something",
+  "tool",
+  "app",
+  "apps",
+  "my",
+  "me",
+  "on",
+  "of",
+  "and",
+  "or",
+  "run",
+  "running",
+  "good",
+  "great",
+  "cool",
+  "well",
+]);
+
+type IntentNormalization = {
+  cleanedQuery: string;
+  purposeTerms: string[];
+  boostTerms: string[];
+  displayPurpose: string[];
+};
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -126,6 +179,7 @@ function inferFilters(
   const input = userInput.toLowerCase();
   const applied: string[] = [];
   const next = { ...search };
+  const intent = normalizeIntent(userInput);
 
   const detectedLanguage = detectLanguage(input);
   if (!next.language && detectedLanguage) {
@@ -172,33 +226,14 @@ function inferFilters(
     applied.push("License: open source");
   }
 
-  const purposeTerms = normalizeSearchQuery(userInput)
-    .split(/\s+/)
-    .filter(Boolean)
-    .filter(
-      (word) =>
-        ![
-          "python",
-          "typescript",
-          "javascript",
-          "rust",
-          "go",
-          "java",
-          "lightweight",
-          "production",
-          "ready",
-          "documented",
-          "mit",
-          "open",
-          "source",
-          "actively",
-          "maintained",
-          "updated",
-          "recently",
-        ].includes(word)
-    );
-  if (purposeTerms.length > 0) {
-    applied.push(`Purpose: ${purposeTerms.join(" ")}`);
+  if (intent.boostTerms.length > 0) {
+    next.query = `${next.query} ${intent.boostTerms.join(" ")}`.trim();
+  } else if (intent.cleanedQuery) {
+    next.query = intent.cleanedQuery;
+  }
+
+  if (intent.displayPurpose.length > 0) {
+    applied.push(`Purpose: ${intent.displayPurpose.join(", ")}`);
   }
 
   return { search: next, applied };
@@ -215,29 +250,190 @@ function normalizeSearchQuery(input: string): string {
     .replace(/[^\w\s-]/g, " ")
     .split(/\s+/)
     .filter(Boolean)
-    .filter(
-      (word) =>
-        !new Set([
-          "find",
-          "top",
-          "best",
-          "repos",
-          "repo",
-          "for",
-          "building",
-          "build",
-          "with",
-          "using",
-          "that",
-          "a",
-          "an",
-          "the",
-          "in",
-          "to",
-        ]).has(word)
-    );
+    .filter((word) => !STOP_WORDS.has(word));
 
   return cleaned.join(" ").trim();
+}
+
+function normalizeIntent(input: string): IntentNormalization {
+  let cleaned = input.toLowerCase();
+  const replacements: Array<[RegExp, string]> = [
+    [/\bi want\b/g, " "],
+    [/\bi need\b/g, " "],
+    [/\bi(?:'d| would) like\b/g, " "],
+    [/\bi(?:'m| am) looking for\b/g, " "],
+    [/\bon my laptop\b/g, " local desktop "],
+    [/\bon desktop\b/g, " desktop "],
+    [/\bopen source\b/g, " open-source "],
+    [/\bwell documented\b|\bwell-documented\b|\bgood docs\b/g, " documented "],
+    [/\bself hosted\b|\bself-hosted\b/g, " self-hosted "],
+    [/\blocal llms?\b/g, " local-llm ollama inference chat "],
+    [/\bllms?\b/g, " llm inference chat "],
+    [/\brest apis?\b/g, " rest-api api-framework "],
+    [/\bhttp client\b/g, " http-client api-client "],
+    [/\breal time\b|\brealtime\b/g, " realtime websocket "],
+    [/\bdesktop app\b|\bdesktop application\b/g, " desktop-app electron gui "],
+  ];
+
+  for (const [pattern, replacement] of replacements) {
+    cleaned = cleaned.replace(pattern, replacement);
+  }
+
+  const displayPurpose = new Set<string>();
+  if (/\bdesktop-app\b|\bdesktop\b/.test(cleaned)) {
+    displayPurpose.add("desktop app");
+  }
+  if (/\blocal-llm\b|\bllm\b|\bollama\b|\binference\b|\bchat\b/.test(cleaned)) {
+    displayPurpose.add("local LLM chat / inference");
+  }
+  if (/\bself-hosted\b/.test(cleaned)) {
+    displayPurpose.add("self-hosted");
+  }
+  if (/\brest-api\b|\bapi-framework\b/.test(cleaned)) {
+    displayPurpose.add("REST API");
+  }
+  if (/\bhttp-client\b|\bapi-client\b/.test(cleaned)) {
+    displayPurpose.add("HTTP client");
+  }
+  if (/\brealtime\b|\bwebsocket\b/.test(cleaned)) {
+    displayPurpose.add("real-time / websocket");
+  }
+
+  const purposeTerms = cleaned
+    .replace(/[^\w\s-]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word.replace(/^-+|-+$/g, ""))
+    .filter(Boolean)
+    .filter(
+      (word) =>
+        ![
+          "python",
+          "typescript",
+          "javascript",
+          "rust",
+          "go",
+          "java",
+          "lightweight",
+          "production",
+          "ready",
+          "documented",
+          "documentation",
+          "docs",
+          "mit",
+          "apache",
+          "open",
+          "source",
+          "open-source",
+          "actively",
+          "maintained",
+          "updated",
+          "recently",
+          "documented",
+        ].includes(word)
+    );
+
+  const uniquePurposeTerms = [...new Set(purposeTerms.filter((word) => !STOP_WORDS.has(word)))];
+  const boostTerms = uniquePurposeTerms.filter((term) =>
+    ["ollama", "desktop-app", "realtime", "websocket", "rest-api", "api-framework", "http-client"].includes(
+      term
+    )
+  );
+
+  return {
+    cleanedQuery: uniquePurposeTerms.join(" ").trim(),
+    purposeTerms: uniquePurposeTerms,
+    boostTerms,
+    displayPurpose: [...displayPurpose],
+  };
+}
+
+function extractPurposeTerms(input: string): string[] {
+  return normalizeIntent(input).purposeTerms;
+}
+
+function tokenizeRepoText(repo: SearchResult): Set<string> {
+  const bag = [
+    repo.fullName,
+    repo.name,
+    repo.description ?? "",
+    ...(repo.topics ?? []),
+  ]
+    .join(" ")
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+
+  return new Set(bag);
+}
+
+function scoreSearchCandidate(
+  repo: SearchResult,
+  search: NonNullable<SearchPlan["search"]>,
+  purposeTerms: string[]
+): number {
+  let score = 0;
+  const repoTokens = tokenizeRepoText(repo);
+
+  if (search.language) {
+    if ((repo.language ?? "").toLowerCase() === search.language.toLowerCase()) {
+      score += 2;
+    } else if (repo.language) {
+      score -= 4;
+    }
+  }
+
+  const matchedTerms = purposeTerms.filter((term) => repoTokens.has(term));
+  score += matchedTerms.length * 2.5;
+
+  if (purposeTerms.some((term) => ["ollama", "llm", "inference", "chat"].includes(term))) {
+    const llmSignals = ["ollama", "llm", "inference", "chat", "desktop", "electron", "gui"];
+    const signalMatches = llmSignals.filter((term) => repoTokens.has(term)).length;
+    score += signalMatches * 0.75;
+  }
+
+  const ageDays = Math.floor((Date.now() - repo.pushedAt.getTime()) / (24 * 60 * 60 * 1000));
+  if (ageDays <= 7) score += 2;
+  else if (ageDays <= 30) score += 1.5;
+  else if (ageDays <= 180) score += 0.5;
+  else score -= 1;
+
+  score += Math.min(4, Math.log10(Math.max(repo.stars, 1)));
+
+  if (/\blightweight\b/.test(search.query.toLowerCase()) && repoTokens.has("lightweight")) {
+    score += 1;
+  }
+  if (/\bproduction-ready\b/.test(search.query.toLowerCase()) && repo.stars >= 1000) {
+    score += 1;
+  }
+  if (/\bdocumentation\b|\bdocs\b/.test(search.query.toLowerCase())) {
+    if (repoTokens.has("documentation") || repoTokens.has("docs")) score += 1;
+  }
+
+  return score;
+}
+
+function curateSearchResults(
+  results: SearchResult[],
+  search: NonNullable<SearchPlan["search"]>,
+  userInput: string
+): SearchResult[] {
+  const purposeTerms = normalizeIntent(userInput).purposeTerms;
+  const scored = results
+    .map((repo) => ({
+      repo,
+      score: scoreSearchCandidate(repo, search, purposeTerms),
+    }))
+    .filter(({ repo, score }) => {
+      if (search.language && repo.language && repo.language.toLowerCase() !== search.language.toLowerCase()) {
+        return false;
+      }
+      return score >= 2;
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return scored.map((entry) => entry.repo);
 }
 
 function pickResults(results: SearchResult[], top: number, random: boolean): SearchResult[] {
@@ -318,19 +514,78 @@ function buildRecommendationReason(item: AnalyzedRepo): string {
   return parts.join(", ");
 }
 
-function computeScore(item: AnalyzedRepo): number {
-  const starsScore = Math.min(5, Math.log10(Math.max(item.search.stars, 1)));
+function computeScore(
+  item: AnalyzedRepo,
+  search: NonNullable<SearchPlan["search"]>,
+  purposeTerms: string[]
+): number {
+  const starsScore = Math.min(3, Math.log10(Math.max(item.search.stars, 1)));
   const ageDays = Math.floor((Date.now() - getLastCommit(item).getTime()) / (24 * 60 * 60 * 1000));
-  const recencyScore = ageDays <= 7 ? 3 : ageDays <= 30 ? 2 : ageDays <= 180 ? 1 : 0;
+  const recencyScore = ageDays <= 7 ? 2.5 : ageDays <= 30 ? 2 : ageDays <= 180 ? 1 : 0;
   const issueScore =
     item.metrics && !item.error
-      ? item.metrics.openIssues <= 50
+      ? item.metrics.openIssues <= 25
         ? 2
-        : item.metrics.openIssues <= 200
+        : item.metrics.openIssues <= 100
         ? 1
         : 0
       : 0;
-  return Math.max(1, Math.min(10, Math.round(starsScore + recencyScore + issueScore)));
+  const matchScore = Math.min(3, Math.max(0, scoreSearchCandidate(item.search, search, purposeTerms) / 3));
+  return Math.max(1, Math.min(10, Math.round(starsScore + recencyScore + issueScore + matchScore)));
+}
+
+function curateAnalyzedResults(
+  results: AnalyzedRepo[],
+  search: NonNullable<SearchPlan["search"]>,
+  userInput: string
+): AnalyzedRepo[] {
+  const purposeTerms = extractPurposeTerms(userInput);
+  const scored = results
+    .map((item) => ({
+      item,
+      score: computeScore(item, search, purposeTerms),
+    }))
+    .filter(({ item, score }) => {
+      if (search.language) {
+        const primaryLanguage = getPrimaryLanguage(item).toLowerCase();
+        if (primaryLanguage !== search.language.toLowerCase()) {
+          return false;
+        }
+      }
+      return score >= 4;
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return scored.map((entry) => entry.item);
+}
+
+function isWeakShortlist(
+  results: AnalyzedRepo[],
+  search: NonNullable<SearchPlan["search"]>,
+  userInput: string
+): boolean {
+  if (results.length === 0) return true;
+  const purposeTerms = extractPurposeTerms(userInput);
+  const scores = results.map((item) => computeScore(item, search, purposeTerms));
+  const strongCount = scores.filter((score) => score >= 6).length;
+  return strongCount === 0;
+}
+
+function buildRepoUrl(fullName: string): string {
+  return `https://github.com/${fullName}`;
+}
+
+function openUrl(url: string): void {
+  const platform = process.platform;
+  if (platform === "darwin") {
+    spawn("open", [url], { stdio: "ignore", detached: true }).unref();
+    return;
+  }
+  if (platform === "win32") {
+    spawn("cmd", ["/c", "start", "", url], { stdio: "ignore", detached: true }).unref();
+    return;
+  }
+  spawn("xdg-open", [url], { stdio: "ignore", detached: true }).unref();
 }
 
 function buildShortlistNames(results: AnalyzedRepo[]): string {
@@ -349,23 +604,30 @@ function buildShortlistNames(results: AnalyzedRepo[]): string {
     .join(", ");
 }
 
-async function writeScoutReport(results: AnalyzedRepo[], summary: string): Promise<void> {
+async function writeScoutReport(
+  results: AnalyzedRepo[],
+  summary: string,
+  search: NonNullable<SearchPlan["search"]>,
+  userInput: string
+): Promise<void> {
   await mkdir("reports", { recursive: true });
 
   const timestamp = new Date().toISOString();
   const header = `# Repo Scout Results\n\nGenerated: ${timestamp}\n`;
   const tableHeader = [
-    "| Repo | Stars | Language | Last Commit | Why Recommended | Score (1-10) |",
-    "| --- | ---: | --- | --- | --- | ---: |",
+    "| Repo | Description | Stars | Language | Last Commit | Why Recommended | Score (1-10) | Link |",
+    "| --- | --- | ---: | --- | --- | --- | ---: | --- |",
   ];
   const rows = results.map((item) => {
     const repo = item.search.fullName;
+    const description = (item.search.description ?? "No description provided.").replace(/\|/g, "\\|");
     const stars = item.search.stars.toLocaleString();
     const language = getPrimaryLanguage(item);
     const lastCommit = getLastCommit(item).toISOString().slice(0, 10);
     const why = item.error ? `Analysis failed: ${item.error}` : buildRecommendationReason(item);
-    const score = computeScore(item);
-    return `| ${repo} | ${stars} | ${language} | ${lastCommit} | ${why} | ${score} |`;
+    const score = computeScore(item, search, extractPurposeTerms(userInput));
+    const link = buildRepoUrl(repo);
+    return `| ${repo} | ${description} | ${stars} | ${language} | ${lastCommit} | ${why} | ${score} | ${link} |`;
   });
 
   const content = [
@@ -386,7 +648,11 @@ async function writeScoutReport(results: AnalyzedRepo[], summary: string): Promi
 
 function renderShortlist(results: AnalyzedRepo[]): string {
   return results
-    .map((item, index) => `${index + 1}. ${item.search.fullName}`)
+    .map((item, index) => {
+      const description = item.search.description ?? "No description provided.";
+      const link = buildRepoUrl(item.search.fullName);
+      return [`${index + 1}. ${item.search.fullName}`, `   ${description}`, `   ${link}`].join("\n");
+    })
     .join("\n");
 }
 
@@ -414,6 +680,16 @@ async function promptForSelection(
 
     if (selection === "none") {
       return { kind: "none" };
+    }
+
+    const openMatch = selection.match(/^open\s+(\d+)$/);
+    if (openMatch) {
+      const index = Number(openMatch[1]);
+      if (Number.isInteger(index) && index >= 1 && index <= max) {
+        return { kind: "open", index: index - 1 };
+      }
+      output.write(`${INVALID_SELECTION_MESSAGE}\n`);
+      continue;
     }
 
     const index = Number(selection);
@@ -453,12 +729,18 @@ async function promptAfterAnalysis(
 ): Promise<TextChoice> {
   while (true) {
     const nextStep = (
-      await rl.question("What next? Type 'back' to return to the shortlist, or enter a new search.\n> ")
+      await rl.question(
+        "What next? Type 'open' to view the repo on GitHub, 'back' to return to the shortlist, or enter a new search.\n> "
+      )
     ).trim();
 
     if (nextStep === "exit" || nextStep === "quit") {
       output.write("Goodbye.\n");
       return { kind: "exit" };
+    }
+
+    if (nextStep === "open") {
+      return { kind: "open" };
     }
 
     if (nextStep === "back") {
@@ -534,12 +816,12 @@ async function loadScoutSelectionContext(
         .slice(1, -1)
         .map((part) => part.trim());
 
-      if (columns.length < 6) continue;
+      if (columns.length < 8) continue;
       if (columns[0] !== repoFullName) continue;
 
-      const score = Number(columns[5]);
+      const score = Number(columns[6]);
       return {
-        whyRecommended: columns[4],
+        whyRecommended: columns[5],
         score: Number.isNaN(score) ? null : score,
       };
     }
@@ -606,6 +888,7 @@ async function writeAnalysisReport(context: RepoContext): Promise<void> {
     "## Repository Metadata",
     "",
     `- Repo: ${context.repoData.fullName}`,
+    `- URL: ${buildRepoUrl(context.repoData.fullName)}`,
     `- Default Branch: ${context.repoData.defaultBranch}`,
     `- Created At: ${context.repoData.createdAt.toISOString()}`,
     `- Last Push: ${context.repoData.pushedAt.toISOString()}`,
@@ -890,12 +1173,20 @@ async function main() {
         }
       }
       results = results.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
-      const picked = pickResults(results, plan.search.top, plan.search.random);
+      const curated = curateSearchResults(results, effectiveSearch, userInput);
+      const picked = pickResults(curated, effectiveSearch.top, effectiveSearch.random);
 
       output.write("Analyzing results...\n");
-      const analyzed = await analyzePickedRepos(analyzeRepo, picked);
-      const response = await brain.respond(history, userInput, effectiveSearch, analyzed);
-      await writeScoutReport(analyzed, response);
+      const analyzed = curateAnalyzedResults(
+        await analyzePickedRepos(analyzeRepo, picked),
+        effectiveSearch,
+        userInput
+      );
+      const weakShortlist = isWeakShortlist(analyzed, effectiveSearch, userInput);
+      const response = weakShortlist
+        ? "I found only weak matches for that request. Try refining by framework, maintenance level, stars, or license."
+        : await brain.respond(history, userInput, effectiveSearch, analyzed);
+      await writeScoutReport(analyzed, response, effectiveSearch, userInput);
       const filterText = renderAppliedFilters(inferred.applied);
       if (filterText) {
         output.write(`${filterText}\n`);
@@ -903,7 +1194,7 @@ async function main() {
       output.write(`${response}\n`);
       history.push({ role: "assistant", content: response });
 
-      if (analyzed.length === 0) {
+      if (analyzed.length === 0 || weakShortlist) {
         continue;
       }
 
@@ -914,6 +1205,14 @@ async function main() {
 
         if (selection.kind === "exit") {
           return;
+        }
+
+        if (selection.kind === "open") {
+          const repo = analyzed[selection.index].search;
+          const url = buildRepoUrl(repo.fullName);
+          output.write(`Opening ${url}\n`);
+          openUrl(url);
+          continue;
         }
 
         if (selection.kind === "back") {
@@ -935,6 +1234,9 @@ async function main() {
             if (refinement.kind === "back") {
               continue shortlist;
             }
+            if (refinement.kind !== "text") {
+              continue;
+            }
 
             pendingInput = refinement.value;
             continue outer;
@@ -952,8 +1254,17 @@ async function main() {
           if (nextStep.kind === "exit") {
             return;
           }
+          if (nextStep.kind === "open") {
+            const url = buildRepoUrl(chosen.fullName);
+            output.write(`Opening ${url}\n`);
+            openUrl(url);
+            continue;
+          }
           if (nextStep.kind === "back") {
             continue shortlist;
+          }
+          if (nextStep.kind !== "text") {
+            continue;
           }
 
           pendingInput = nextStep.value;
