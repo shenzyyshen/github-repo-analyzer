@@ -23,7 +23,7 @@ Translate a natural-language request into a GitHub search query, fetch candidate
 ## Output
 Save a markdown report to `./reports/REPO_SCOUT_RESULTS.md` with:
 - A timestamp at the top
-- A structured markdown table with columns: Repo, Stars, Language, Last Commit, Why Recommended, Score (1-10)
+- A structured markdown table with columns: Repo, Description, Stars, Language, Last Commit, Why Recommended, Score (1-10), Link
 - A short conversational summary explaining the overall recommendation and trade-offs
 
 ## Guardrails

@@ -6,3 +6,6 @@
 node_modules
 dist
 *.log
+reports/*.md
+!reports/.gitkeep
+nano

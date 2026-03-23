@@ -113,7 +113,7 @@ This starts an interactive terminal session that:
 - accepts a plain-English repo discovery request
 - searches and analyzes GitHub repos
 - responds conversationally
-- overwrites `reports/REPO_SCOUT_RESULTS.md` on each run with a timestamped shortlist report
+- overwrites `reports/REPO_SCOUT_RESULTS.md` on each run with a timestamped shortlist report that includes repo descriptions and GitHub links
 
 ### API server
 ```bash
