@@ -10,6 +10,7 @@ import { PrismaAdapter } from "../adapters/database/PrismaAdapter.js";
 import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { Metrics } from "../domain/entities/Metrics.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
+import type { RepoRootEntry } from "../ports/RepoApiPort.js";
 import {
   buildRetrievalQueries,
   buildBroaderSearchQuery,
@@ -43,6 +44,8 @@ type RepoContext = {
   languages: Record<string, number>;
   contributors: number;
   verifiedOpenIssues: number;
+  readme: string | null;
+  rootContents: RepoRootEntry[];
 };
 
 type ScoutSelectionContext = {
@@ -818,12 +821,14 @@ async function buildRepoContext(
   analyzeRepo: AnalyzeRepo,
   repo: SearchResult
 ): Promise<RepoContext> {
-  const [metrics, repoData, languages, contributors, verifiedOpenIssues] = await Promise.all([
+  const [metrics, repoData, languages, contributors, verifiedOpenIssues, readme, rootContents] = await Promise.all([
     analyzeRepo.execute(repo.owner, repo.name, true),
     githubAdapter.getRepo(repo.owner, repo.name),
     githubAdapter.getLanguages(repo.owner, repo.name),
     githubAdapter.getContributors(repo.owner, repo.name),
     githubAdapter.getIssues(repo.owner, repo.name),
+    githubAdapter.getReadme(repo.owner, repo.name),
+    githubAdapter.getRootContents(repo.owner, repo.name),
   ]);
 
   return {
@@ -841,7 +846,48 @@ async function buildRepoContext(
     languages,
     contributors,
     verifiedOpenIssues,
+    readme,
+    rootContents,
   };
+}
+
+function detectStackSignals(rootContents: RepoRootEntry[], readme: string | null): string[] {
+  const names = new Set(rootContents.map((entry) => entry.name.toLowerCase()));
+  const readmeText = readme?.toLowerCase() ?? "";
+  const signals: string[] = [];
+
+  if (names.has("package.json")) signals.push("Node.js / JavaScript or TypeScript");
+  if (names.has("tsconfig.json")) signals.push("TypeScript");
+  if (names.has("pyproject.toml") || names.has("requirements.txt")) signals.push("Python");
+  if (names.has("go.mod")) signals.push("Go");
+  if (names.has("cargo.toml")) signals.push("Rust");
+  if (names.has("dockerfile")) signals.push("Docker");
+  if (names.has("docker-compose.yml") || names.has("docker-compose.yaml")) signals.push("Docker Compose");
+  if (names.has(".env.example")) signals.push("environment-template provided");
+  if ([...names].some((name) => name.startsWith(".github"))) signals.push("GitHub Actions / CI config");
+  if (readmeText.includes("typescript") && !signals.includes("TypeScript")) signals.push("TypeScript");
+  if (readmeText.includes("python") && !signals.includes("Python")) signals.push("Python");
+
+  return [...new Set(signals)];
+}
+
+function buildStructureOverview(rootContents: RepoRootEntry[]): string[] {
+  const names = rootContents.map((entry) => entry.name).sort((a, b) => a.localeCompare(b));
+  return names.slice(0, 15);
+}
+
+function detectSetupSignals(rootContents: RepoRootEntry[], readme: string | null): string[] {
+  const names = new Set(rootContents.map((entry) => entry.name.toLowerCase()));
+  const signals: string[] = [];
+
+  if (readme && readme.length > 300) signals.push("README has meaningful setup/documentation content");
+  if (names.has("dockerfile")) signals.push("Docker setup present");
+  if (names.has("docker-compose.yml") || names.has("docker-compose.yaml")) signals.push("docker-compose present");
+  if (names.has("makefile")) signals.push("Makefile present");
+  if (names.has(".env.example")) signals.push(".env.example present");
+  if ([...names].some((name) => name.startsWith(".github"))) signals.push("CI/workflow config present");
+
+  return signals;
 }
 
 async function loadScoutSelectionContext(
@@ -885,6 +931,19 @@ async function writeAnalysisReport(context: RepoContext): Promise<void> {
     .sort((a, b) => b[1] - a[1])
     .map(([name, bytes]) => `- ${name}: ${bytes.toLocaleString()}`)
     .join("\n");
+  const stackSignals = detectStackSignals(context.rootContents, context.readme);
+  const structureOverview = buildStructureOverview(context.rootContents);
+  const setupSignals = detectSetupSignals(context.rootContents, context.readme);
+  const readmeSnippet = context.readme
+    ? context.readme
+        .replace(/\r/g, "")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .slice(0, 6)
+        .join(" ")
+        .slice(0, 500)
+    : null;
 
   const selectedSection = scoutContext
     ? [
@@ -929,6 +988,22 @@ async function writeAnalysisReport(context: RepoContext): Promise<void> {
     "",
     `${context.repoData.fullName} is a ${context.repo.language ?? "software"} repository with ${context.metrics.stars.toLocaleString()} stars and ${context.contributors.toLocaleString()} contributors.`,
     context.repoData.description ?? "No description provided.",
+    "",
+    "## Tech Stack Signals",
+    "",
+    ...(stackSignals.length > 0 ? stackSignals.map((signal) => `- ${signal}`) : ["- No strong stack signal detected from root files"]),
+    "",
+    "## Structure Overview",
+    "",
+    ...(structureOverview.length > 0 ? structureOverview.map((entry) => `- ${entry}`) : ["- Root contents unavailable"]),
+    "",
+    "## Setup Quality Signals",
+    "",
+    ...(setupSignals.length > 0 ? setupSignals.map((signal) => `- ${signal}`) : ["- No obvious setup-quality signals detected"]),
+    "",
+    "## README Snapshot",
+    "",
+    readmeSnippet ?? "README unavailable.",
     "",
     "## Repository Metadata",
     "",
