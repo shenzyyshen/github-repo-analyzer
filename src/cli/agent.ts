@@ -85,6 +85,7 @@ type RankedShortlistItem = {
   bestFor: string;
   why: string;
   tradeoff: string | null;
+  risk: string | null;
   fitType: "direct match" | "production choice" | "adaptable framework" | "niche option" | "balanced option";
 };
 
@@ -638,6 +639,7 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
       score: Math.max(1, Math.min(10, Math.round(weightedScore))),
       why: whyParts.join("; "),
       tradeoff,
+      risk: buildRiskSummary(item),
       bestFor,
       fitType,
     };
@@ -662,23 +664,80 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
   return ranked;
 }
 
-function buildCaution(item: AnalyzedRepo): string | null {
+function buildRiskSummary(item: AnalyzedRepo): string | null {
   const ageDays = Math.floor((Date.now() - getLastCommit(item).getTime()) / (24 * 60 * 60 * 1000));
+  const contributors = getContributorCount(item);
+  const stars = item.search.stars;
+  const openIssues = item.metrics?.openIssues ?? 0;
+  const issuePressure = openIssues / Math.max(stars, 1);
+  const rootNames = new Set(item.rootContents.map((entry) => entry.name.toLowerCase()));
+  const setupSignals =
+    Number(rootNames.has("dockerfile")) +
+    Number(rootNames.has("docker-compose.yml") || rootNames.has("docker-compose.yaml")) +
+    Number(rootNames.has(".env.example")) +
+    Number(rootNames.has("package.json") || rootNames.has("pyproject.toml") || rootNames.has("requirements.txt")) +
+    Number([...rootNames].some((name) => name.startsWith(".github")));
 
   if (item.error) {
     return `analysis failed: ${item.error}`;
   }
-  if (item.metrics && item.metrics.openIssues > 300) {
-    return "high issue load";
+  if (issuePressure > 0.35 && contributors < 5) {
+    return "issue pressure looks high relative to repo size and maintainer depth";
   }
   if (ageDays > 180) {
-    return "not recently active";
+    return "maintenance risk: not recently active";
+  }
+  if (!item.latestRelease && stars >= 1000) {
+    return "release risk: no clear release signal despite meaningful adoption";
+  }
+  if (contributors <= 1 && stars < 250) {
+    return "adoption risk: low contributor depth";
+  }
+  if (setupSignals <= 1) {
+    return "setup risk: weak operational/setup signals from the root snapshot";
   }
   if (item.search.stars < 25) {
-    return "low adoption signal";
+    return "adoption risk: low external validation signal";
   }
 
   return null;
+}
+
+function buildRiskDetails(context: RepoContext): string[] {
+  const risks: string[] = [];
+  const ageDays = Math.floor((Date.now() - context.metrics.lastCommit.getTime()) / (24 * 60 * 60 * 1000));
+  const issuePressure = context.verifiedOpenIssues / Math.max(context.metrics.stars, 1);
+  const rootNames = new Set(context.rootContents.map((entry) => entry.name.toLowerCase()));
+  const setupSignals =
+    Number(rootNames.has("dockerfile")) +
+    Number(rootNames.has("docker-compose.yml") || rootNames.has("docker-compose.yaml")) +
+    Number(rootNames.has(".env.example")) +
+    Number(rootNames.has("package.json") || rootNames.has("pyproject.toml") || rootNames.has("requirements.txt")) +
+    Number([...rootNames].some((name) => name.startsWith(".github")));
+
+  if (issuePressure > 0.35 && context.contributors < 5) {
+    risks.push("Issue pressure looks high relative to the repo's size and contributor depth.");
+  } else if (issuePressure > 0.1 && context.contributors < 3) {
+    risks.push("Issue pressure is non-trivial and maintainer depth is limited.");
+  }
+
+  if (ageDays > 180) {
+    risks.push("Recent maintenance activity is weak.");
+  }
+
+  if (!context.latestRelease) {
+    risks.push("No GitHub release signal is present.");
+  }
+
+  if (context.contributors <= 1) {
+    risks.push("Contributor depth is shallow, which increases bus-factor risk.");
+  }
+
+  if (setupSignals <= 1) {
+    risks.push("Setup and operational signals are limited from the root snapshot.");
+  }
+
+  return risks;
 }
 
 function buildShortlistNames(results: Array<AnalyzedRepo | RankedShortlistItem>): string {
@@ -706,8 +765,8 @@ async function writeScoutReport(results: RankedShortlistItem[], summary: string)
   const timestamp = new Date().toISOString();
   const header = `# Repo Scout Results\n\nGenerated: ${timestamp}\n`;
   const tableHeader = [
-    "| Repo | Score | Best For | Why Recommended | Tradeoff | Stars | Forks | Contributors | Age | Language | Last Commit |",
-    "| --- | ---: | --- | --- | --- | ---: | ---: | ---: | --- | --- | --- |",
+    "| Repo | Score | Best For | Why Recommended | Tradeoff | Risk | Stars | Forks | Contributors | Age | Language | Last Commit |",
+    "| --- | ---: | --- | --- | --- | --- | ---: | ---: | ---: | --- | --- | --- |",
   ];
   const rows = results.map((ranked) => {
     const { item } = ranked;
@@ -718,7 +777,7 @@ async function writeScoutReport(results: RankedShortlistItem[], summary: string)
     const age = getRepoAgeLabel(item);
     const language = getPrimaryLanguage(item);
     const lastCommit = getLastCommit(item).toISOString().slice(0, 10);
-    return `| ${repo} | ${ranked.score} | ${ranked.bestFor} | ${ranked.why} | ${ranked.tradeoff ?? "—"} | ${stars} | ${forks} | ${contributors} | ${age} | ${language} | ${lastCommit} |`;
+    return `| ${repo} | ${ranked.score} | ${ranked.bestFor} | ${ranked.why} | ${ranked.tradeoff ?? "—"} | ${ranked.risk ?? "—"} | ${stars} | ${forks} | ${contributors} | ${age} | ${language} | ${lastCommit} |`;
   });
 
   const content = [
@@ -741,7 +800,7 @@ function renderShortlist(results: RankedShortlistItem[]): string {
   return results
     .map((ranked, index) => {
       const { item } = ranked;
-      const caution = buildCaution(item);
+      const caution = buildRiskSummary(item);
       const stars = item.search.stars.toLocaleString();
       const forks = item.search.forks.toLocaleString();
       const contributors = getContributorCount(item).toLocaleString();
@@ -754,7 +813,7 @@ function renderShortlist(results: RankedShortlistItem[]): string {
         `   Best for: ${ranked.bestFor}`,
         `   Why: ${ranked.why}`,
         ranked.tradeoff ? `   Tradeoff: ${ranked.tradeoff}` : null,
-        caution ? `   Caution: ${caution}` : null,
+        caution ? `   Risk: ${caution}` : null,
         `   Stars: ${stars} | Forks: ${forks} | Contributors: ${contributors}`,
         `   Age: ${age} | Last push: ${lastCommit} | Language: ${language}`,
         `   GitHub: ${buildRepoUrl(item.search.fullName)}`,
@@ -994,6 +1053,7 @@ async function writeAnalysisReport(context: RepoContext): Promise<void> {
   const latestReleaseLine = context.latestRelease
     ? `- Latest Release: ${context.latestRelease.tagName} (${context.latestRelease.publishedAt.toISOString()})`
     : "- Latest Release: none detected";
+  const riskDetails = buildRiskDetails(context);
   const repoUrl = buildRepoUrl(context.repoData.fullName);
   const analysisHeadline = scoutContext
     ? `${context.repoData.fullName} was shortlisted because the scout identified it as a strong candidate for this request, with particular emphasis on: ${scoutContext.whyRecommended}.`
@@ -1077,6 +1137,10 @@ async function writeAnalysisReport(context: RepoContext): Promise<void> {
     "## Setup Quality Signals",
     "",
     ...(setupSignals.length > 0 ? setupSignals.map((signal) => `- ${signal}`) : ["- No obvious setup-quality signals detected"]),
+    "",
+    "## Risks",
+    "",
+    ...(riskDetails.length > 0 ? riskDetails.map((risk) => `- ${risk}`) : ["- No major structural or maintenance risk stood out from the current snapshot."]),
     "",
     "## README Snapshot",
     "",
