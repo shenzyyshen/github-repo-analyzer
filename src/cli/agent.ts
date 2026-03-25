@@ -242,6 +242,103 @@ function tokenizeRepo(item: AnalyzedRepo): Set<string> {
   );
 }
 
+function tokenizeSearchResult(repo: SearchResult): Set<string> {
+  return new Set(
+    [
+      repo.fullName,
+      repo.name,
+      repo.description ?? "",
+      repo.language ?? "",
+      ...(repo.topics ?? []),
+    ]
+      .join(" ")
+      .toLowerCase()
+      .replace(/[^\w\s-]/g, " ")
+      .split(/\s+/)
+      .filter(Boolean)
+  );
+}
+
+function preselectCandidates(
+  results: SearchResult[],
+  intent: ParsedIntent,
+  top: number,
+  random: boolean
+): SearchResult[] {
+  if (random) {
+    return pickResults(results, top, true);
+  }
+
+  const candidatePoolSize = Math.min(Math.max(top * 4, 15), 25, results.length);
+  const scored = results
+    .map((repo) => {
+      const tokens = tokenizeSearchResult(repo);
+      const intentTerms = [
+        ...intent.purposeTerms,
+        ...intent.boostTerms,
+        ...intent.concepts,
+        ...intent.displayTerms.flatMap((term) => term.toLowerCase().split(/\s+/)),
+      ].filter(Boolean);
+      const termMatches = [...new Set(intentTerms)].filter((term) => tokens.has(term)).length;
+      const languageBonus =
+        intent.language && repo.language && repo.language.toLowerCase() === intent.language.toLowerCase() ? 2 : 0;
+      const starsBonus =
+        repo.stars >= 10_000
+          ? 4
+          : repo.stars >= 1_000
+            ? 3
+            : repo.stars >= 100
+              ? 2
+              : repo.stars >= 25
+                ? 1
+                : 0;
+      const forksBonus =
+        repo.forks >= 1_000
+          ? 3
+          : repo.forks >= 100
+            ? 2
+            : repo.forks >= 10
+              ? 1
+              : 0;
+      const repoAgeDays = Math.max(1, Math.floor((Date.now() - repo.createdAt.getTime()) / (24 * 60 * 60 * 1000)));
+      const maturityBonus =
+        repoAgeDays >= 365 * 2
+          ? 3
+          : repoAgeDays >= 365
+            ? 2
+            : repoAgeDays >= 90
+              ? 1
+              : 0;
+      const pushAgeDays = Math.max(1, Math.floor((Date.now() - repo.pushedAt.getTime()) / (24 * 60 * 60 * 1000)));
+      const maintenanceBonus =
+        pushAgeDays <= 30
+          ? 2
+          : pushAgeDays <= 120
+            ? 1
+            : 0;
+      const weakRepoPenalty =
+        repo.stars < 10 && repo.forks === 0 && repoAgeDays < 30
+          ? 4
+          : repo.stars < 25 && repoAgeDays < 45
+            ? 2
+            : 0;
+
+      const prefilterScore =
+        termMatches * 3 +
+        languageBonus +
+        starsBonus +
+        forksBonus +
+        maturityBonus +
+        maintenanceBonus -
+        weakRepoPenalty;
+
+      return { repo, prefilterScore };
+    })
+    .sort((a, b) => b.prefilterScore - a.prefilterScore);
+
+  return scored.slice(0, candidatePoolSize).map((entry) => entry.repo);
+}
+
 type PromptProfile = {
   label: string;
   strictQualityFloor: boolean;
@@ -1151,11 +1248,11 @@ async function main() {
         }
       }
       results = results.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
-      const picked = pickResults(results, plan.search.top, plan.search.random);
-      const hadCandidates = picked.length > 0;
+      const candidates = preselectCandidates(results, intent, plan.search.top, plan.search.random);
+      const hadCandidates = candidates.length > 0;
 
       output.write("Analyzing results...\n");
-      const analyzed = await analyzePickedRepos(analyzeRepo, picked);
+      const analyzed = await analyzePickedRepos(analyzeRepo, candidates);
       const response =
         analyzed.length === 0
           ? intent.confidence < 0.4
@@ -1176,9 +1273,9 @@ async function main() {
       }
 
       const shortlist = rankShortlist(
-        analyzed.length > 0 ? analyzed : picked.map((search) => ({ search, metrics: null, error: null })),
+        analyzed.length > 0 ? analyzed : candidates.map((search) => ({ search, metrics: null, error: null })),
         intent
-      );
+      ).slice(0, plan.search.top);
       await writeScoutReport(shortlist, response);
       output.write(`${renderShortlist(shortlist)}\n`);
 
