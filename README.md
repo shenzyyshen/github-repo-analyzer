@@ -15,11 +15,15 @@ Example prompt:
 - **Natural-language repository discovery**: describe what you want in plain English instead of writing GitHub qualifiers manually
 - **Conversational terminal interface**: run `npm run repo` and interactively search, refine, shortlist, and analyze repos
 - **AI-assisted intent parsing**: extract signals like language, activity, license, maturity, and product type from user prompts
+- **Multi-query retrieval**: generate several GitHub search formulations, merge results, and rank from a broader candidate pool
 - **Concept-aware search broadening**: retry with broader domain terms when the first GitHub query is too narrow
-- **Shortlist ranking with rationale**: rank repos by prompt fit, adoption, maturity, maintenance, and quality-floor filters
-- **Decision-ready shortlist output**: each candidate includes score, best use case, rationale, tradeoff, caution, stars, forks, contributors, age, language, and GitHub link
-- **Deep repo analysis**: select a repo from the shortlist and generate a deeper markdown report in `reports/REPO_ANALYSIS.md`
+- **Shortlist ranking with rationale**: rank repos by prompt fit, adoption, maturity, maintenance, setup signals, release signals, and quality-floor filters
+- **Decision-ready shortlist output**: each candidate includes best use case, rationale, tradeoff, caution, stars, forks, contributors, age, language, and GitHub link
+- **Risk-aware repo curation**: evaluate issue pressure, maintenance risk, release risk, adoption risk, and setup risk
+- **Category extraction**: infer whether a repo is a service, framework, SDK, plugin, CLI, server, workflow, library, or desktop app
+- **Deep repo analysis**: select a repo from the shortlist and generate a richer markdown report in `reports/REPO_ANALYSIS.md`
 - **Saved scout report**: each shortlist run writes `reports/REPO_SCOUT_RESULTS.md`
+- **Session recall**: `seen`, `history`, and `.codex/session.json` preserve earlier shortlists and repo links across restarts
 - **CLI fallback behavior**: if AI query translation is unavailable, the tool falls back to raw GitHub search instead of failing
 - **REST API + MCP support**: same core capabilities can be exposed to programmatic clients and AI tooling
 - **Hexagonal architecture**: domain logic stays isolated from GitHub, database, and transport adapters
@@ -36,9 +40,8 @@ Example prompt:
    - activity
    - product category
    - maturity signals
-4. The system queries GitHub, broadens the search if needed, and analyzes the top candidates.
+4. The system generates multiple GitHub search formulations, merges results, broadens the search if needed, and analyzes a larger candidate pool.
 5. The user sees a ranked shortlist with:
-   - score
    - best use case
    - why it ranked there
    - tradeoffs and cautions
@@ -46,6 +49,8 @@ Example prompt:
 6. The user can then:
    - pick a repo for deeper analysis
    - refine the shortlist
+   - `re run` to get a different set of repos
+   - `seen` / `history` to recall earlier results
    - go back
    - open a repo in the browser
 
@@ -90,6 +95,13 @@ or:
 ```text
 mcp agents for ai and coding tasks
 ```
+
+Useful in-session commands:
+- `re run` — set the current shortlist aside and fetch a different set
+- `seen` — show repos already surfaced in this session
+- `history` — show previous shortlists by prompt
+- `back` — return to the current shortlist
+- `quit` — exit cleanly
 
 ---
 
@@ -158,10 +170,10 @@ This project uses **Hexagonal (Ports & Adapters)** architecture.
 - `src/domain/` contains core entities and use cases
 - `src/ports/` defines the interfaces the domain depends on
 - `src/adapters/` implements GitHub and database access
-- `src/cli/` contains the direct CLI commands, conversational agent, and intent parser
+- `src/cli/` contains the direct CLI commands, conversational agent, intent parser, retrieval logic, shortlist ranking, and session recall
 - `src/server/` exposes the same core logic through API and MCP surfaces
 
-This keeps the product logic separate from infrastructure details and makes search, ranking, analysis, and transport layers easier to evolve independently.
+This keeps the product logic separate from infrastructure details and makes retrieval, ranking, analysis, session recall, and transport layers easier to evolve independently.
 
 See:
 - `ARCHITECTURE.md`
@@ -172,9 +184,9 @@ See:
 
 ## Roadmap
 **Short-term**
-- Better external repo analysis from GitHub README + root contents
+- Better README/topic-based category understanding
 - Stronger prompt-specific ranking and rationale generation
-- Session persistence for the conversational scout
+- Startup session controls like `clear history` or resume prompts
 
 **Medium-term**
 - Search history and saved results
@@ -184,7 +196,7 @@ See:
 **Long-term**
 - Web UI on top of the same API/domain layer
 - Richer analytics and trend tracking
-- More advanced external repo quality analysis
+- Clone-based external repo quality analysis
 
 ---
 
