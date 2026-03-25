@@ -254,6 +254,41 @@ function tokenizeRepo(item: AnalyzedRepo): Set<string> {
   );
 }
 
+type RepoCategory =
+  | "service"
+  | "framework"
+  | "sdk"
+  | "plugin"
+  | "desktop-app"
+  | "cli"
+  | "server"
+  | "workflow"
+  | "library"
+  | "general";
+
+function extractRepoCategory(item: AnalyzedRepo): RepoCategory {
+  const text = [
+    item.search.fullName,
+    item.search.description ?? "",
+    item.readme ?? "",
+    ...item.rootContents.map((entry) => entry.name),
+    ...(item.search.topics ?? []),
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  if (/\borchestrator|workflow|pipeline\b/.test(text)) return "workflow";
+  if (/\belectron|desktop app|desktop application|gui\b/.test(text)) return "desktop-app";
+  if (/\bmcp server|server\b/.test(text)) return "server";
+  if (/\bcli\b|command line/.test(text)) return "cli";
+  if (/\bplugin\b|extension\b/.test(text)) return "plugin";
+  if (/\bsdk\b/.test(text)) return "sdk";
+  if (/\bframework\b|starter\b|boilerplate\b|platform\b/.test(text)) return "framework";
+  if (/\blibrary\b|package\b|module\b/.test(text)) return "library";
+  if (/\bself-hosted\b|docker-compose|dockerfile|service\b|dashboard\b/.test(text)) return "service";
+  return "general";
+}
+
 function tokenizeSearchResult(repo: SearchResult): Set<string> {
   return new Set(
     [
@@ -443,6 +478,7 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
   const prompt = buildPromptProfile(intent);
   const scored = results.map((item) => {
     const tokens = tokenizeRepo(item);
+    const category = extractRepoCategory(item);
     const promptFit = intent.purposeTerms.filter((term) => tokens.has(term)).length;
     const intentText = [intent.normalizedQuery, ...intent.displayTerms, ...intent.purposeTerms, ...intent.concepts]
       .join(" ")
@@ -519,9 +555,8 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
             )
           )
         : 0;
-    const frameworkLike = /\b(framework|sdk|library|toolkit|platform|starter)\b/i.test(
-      item.search.description ?? ""
-    );
+    const frameworkLike =
+      category === "framework" || category === "sdk" || /\b(framework|sdk|library|toolkit|platform|starter)\b/i.test(item.search.description ?? "");
 
     const passesQualityFloor = prompt.strictQualityFloor
       ? ((stars >= 50 && repoAgeDays >= 45 && contributors >= 2) ||
@@ -603,6 +638,7 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
     else if (fitType === "production choice") whyParts.push("maturity and adoption are stronger than the rest of the field");
     else if (fitType === "niche option") whyParts.push("specialized option that matches part of the prompt");
     else if (descriptorBonus > 0) whyParts.push(`${repoDescriptor} shape matches the workflow`);
+    if (category !== "general") whyParts.push(`category suggests a ${category.replace("-", " ")} product shape`);
     if (adoptionRubric >= 2) whyParts.push("strong adoption");
     if (maturityRubric >= 1) whyParts.push("established repo age");
     if (maintenanceRubric >= 1) whyParts.push("recent maintenance");
@@ -632,6 +668,30 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
       } else if (repoDescriptor === "framework") {
         bestFor = "teams building a broader coding-agent platform with MCP support";
       }
+    } else if (category === "service") {
+      bestFor = `teams that want a runnable service for ${prompt.label}`;
+    } else if (category === "framework") {
+      bestFor = `teams building on top of a framework for ${prompt.label}`;
+    } else if (category === "sdk") {
+      bestFor = `teams integrating ${prompt.label} into a larger product`;
+    } else if (category === "plugin") {
+      bestFor = `teams extending an existing toolchain around ${prompt.label}`;
+    } else if (category === "desktop-app") {
+      bestFor = `teams that want a desktop-first experience for ${prompt.label}`;
+    } else if (category === "cli") {
+      bestFor = `teams that prefer a terminal-first workflow for ${prompt.label}`;
+    } else if (category === "server") {
+      bestFor = `teams that want a backend/server implementation for ${prompt.label}`;
+    } else if (category === "workflow") {
+      bestFor = `teams orchestrating multi-step workflows around ${prompt.label}`;
+    } else if (category === "library") {
+      bestFor = `teams embedding ${prompt.label} through a reusable library`;
+    }
+
+    if (!tradeoff) {
+      if (category === "framework" || category === "sdk") tradeoff = "requires more integration work than a turnkey tool";
+      else if (category === "plugin") tradeoff = "depends on an existing host tool or workflow";
+      else if (category === "library") tradeoff = "better for builders than for users seeking a ready-made app";
     }
 
     return {
