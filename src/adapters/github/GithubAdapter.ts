@@ -1,5 +1,5 @@
 import { Octokit } from "@octokit/rest";
-import type { RepoApiPort } from "../../ports/RepoApiPort.js";
+import type { RepoApiPort, RepoRootEntry } from "../../ports/RepoApiPort.js";
 import type { Repo } from "../../domain/entities/Repo.js";
 import type { SearchResult } from "../../domain/entities/SearchResult.js";
 
@@ -82,6 +82,48 @@ export class GithubAdapter implements RepoApiPort {
     }
 
     return Array.isArray(data) ? data.length : 0;
+  }
+
+  async getReadme(owner: string, repo: string): Promise<string | null> {
+    try {
+      const { data } = await this.withRetry(() =>
+        this.client.repos.getReadme({ owner, repo, mediaType: { format: "raw" } })
+      );
+
+      return typeof data === "string" ? data : null;
+    } catch (err: unknown) {
+      const error = err as { status?: number };
+      if (error?.status === 404) {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  async getRootContents(owner: string, repo: string): Promise<RepoRootEntry[]> {
+    try {
+      const { data } = await this.withRetry(() =>
+        this.client.repos.getContent({ owner, repo, path: "" })
+      );
+
+      if (!Array.isArray(data)) {
+        return [];
+      }
+
+      return data
+        .filter((entry) => entry.type === "file" || entry.type === "dir")
+        .map((entry) => ({
+          name: entry.name,
+          path: entry.path,
+          type: entry.type === "dir" ? "dir" : "file",
+        }));
+    } catch (err: unknown) {
+      const error = err as { status?: number };
+      if (error?.status === 404) {
+        return [];
+      }
+      throw err;
+    }
   }
 
   async searchRepos(
