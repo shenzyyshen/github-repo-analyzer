@@ -757,7 +757,7 @@ function renderShortlist(results: RankedShortlistItem[]): string {
         caution ? `   Caution: ${caution}` : null,
         `   Stars: ${stars} | Forks: ${forks} | Contributors: ${contributors}`,
         `   Age: ${age} | Last push: ${lastCommit} | Language: ${language}`,
-        `   ${buildRepoUrl(item.search.fullName)}`,
+        `   GitHub: ${buildRepoUrl(item.search.fullName)}`,
       ].filter(Boolean);
 
       return lines.join("\n");
@@ -994,13 +994,32 @@ async function writeAnalysisReport(context: RepoContext): Promise<void> {
   const latestReleaseLine = context.latestRelease
     ? `- Latest Release: ${context.latestRelease.tagName} (${context.latestRelease.publishedAt.toISOString()})`
     : "- Latest Release: none detected";
+  const repoUrl = buildRepoUrl(context.repoData.fullName);
+  const analysisHeadline = scoutContext
+    ? `${context.repoData.fullName} was shortlisted because the scout identified it as a strong candidate for this request, with particular emphasis on: ${scoutContext.whyRecommended}.`
+    : `${context.repoData.fullName} was analyzed as a candidate repository based on its GitHub metadata, structure signals, and README content.`;
+  const firstImpression = [
+    context.repoData.description ?? null,
+    stackSignals.length > 0 ? `Likely stack: ${stackSignals.join(", ")}.` : null,
+    setupSignals.length > 0 ? `Setup quality signals: ${setupSignals.slice(0, 3).join(", ")}.` : null,
+    context.latestRelease ? `A GitHub release exists (${context.latestRelease.tagName}), which is a useful maturity signal.` : "No GitHub release was detected from the current snapshot.",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const selectionReasons = scoutContext
+    ? [
+        `- Scout score: ${scoutContext.score !== null ? `${scoutContext.score}/10` : "not available"}`,
+        `- Scout rationale: ${scoutContext.whyRecommended}`,
+        `- Current repo description: ${context.repoData.description ?? "No description provided"}`,
+        `- README support: ${readmeSnippet ?? "README unavailable"}`,
+      ].join("\n")
+    : null;
 
   const selectedSection = scoutContext
     ? [
         "## Why This Repo Was Selected",
         "",
-        `Scout reasoning: ${scoutContext.whyRecommended}.`,
-        scoutContext.score !== null ? `Scout score: ${scoutContext.score}/10.` : null,
+        selectionReasons,
         "",
       ]
         .filter(Boolean)
@@ -1031,6 +1050,14 @@ async function writeAnalysisReport(context: RepoContext): Promise<void> {
     "",
     `Generated: ${new Date().toISOString()}`,
     "",
+    "## Analysis Summary",
+    "",
+    analysisHeadline,
+    "",
+    "## First Impression",
+    "",
+    firstImpression,
+    "",
     selectedSection,
     concernsSection,
     focusSection,
@@ -1058,6 +1085,7 @@ async function writeAnalysisReport(context: RepoContext): Promise<void> {
     "## Repository Metadata",
     "",
     `- Repo: ${context.repoData.fullName}`,
+    `- GitHub URL: ${repoUrl}`,
     `- Default Branch: ${context.repoData.defaultBranch}`,
     `- Created At: ${context.repoData.createdAt.toISOString()}`,
     `- Last Push: ${context.repoData.pushedAt.toISOString()}`,
