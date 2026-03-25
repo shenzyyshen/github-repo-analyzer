@@ -860,7 +860,7 @@ function renderShortlist(results: RankedShortlistItem[]): string {
   return results
     .map((ranked, index) => {
       const { item } = ranked;
-      const caution = buildRiskSummary(item);
+      const caution = buildRiskSummary(item) ?? "none / working clean";
       const stars = item.search.stars.toLocaleString();
       const forks = item.search.forks.toLocaleString();
       const contributors = getContributorCount(item).toLocaleString();
@@ -869,19 +869,18 @@ function renderShortlist(results: RankedShortlistItem[]): string {
       const language = getPrimaryLanguage(item);
       const lines = [
         `${index + 1}. ${item.search.fullName}`,
-        `   Score: ${ranked.score}/10`,
         `   Best for: ${ranked.bestFor}`,
         `   Why: ${ranked.why}`,
         ranked.tradeoff ? `   Tradeoff: ${ranked.tradeoff}` : null,
-        caution ? `   Risk: ${caution}` : null,
+        `   Caution: ${caution}`,
         `   Stars: ${stars} | Forks: ${forks} | Contributors: ${contributors}`,
         `   Age: ${age} | Last push: ${lastCommit} | Language: ${language}`,
-        `   GitHub: ${buildRepoUrl(item.search.fullName)}`,
+        `   ${buildRepoUrl(item.search.fullName)}`,
       ].filter(Boolean);
 
       return lines.join("\n");
     })
-    .join("\n");
+    .join("\n\n");
 }
 
 async function promptForSelection(
