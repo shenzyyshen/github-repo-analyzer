@@ -1,5 +1,5 @@
 import { Octokit } from "@octokit/rest";
-import type { RepoApiPort, RepoRootEntry } from "../../ports/RepoApiPort.js";
+import type { RepoApiPort, RepoRootEntry, RepoReleaseInfo } from "../../ports/RepoApiPort.js";
 import type { Repo } from "../../domain/entities/Repo.js";
 import type { SearchResult } from "../../domain/entities/SearchResult.js";
 
@@ -121,6 +121,25 @@ export class GithubAdapter implements RepoApiPort {
       const error = err as { status?: number };
       if (error?.status === 404) {
         return [];
+      }
+      throw err;
+    }
+  }
+
+  async getLatestRelease(owner: string, repo: string): Promise<RepoReleaseInfo | null> {
+    try {
+      const { data } = await this.withRetry(() =>
+        this.client.repos.getLatestRelease({ owner, repo })
+      );
+
+      return {
+        tagName: data.tag_name,
+        publishedAt: new Date(data.published_at ?? data.created_at ?? Date.now()),
+      };
+    } catch (err: unknown) {
+      const error = err as { status?: number };
+      if (error?.status === 404) {
+        return null;
       }
       throw err;
     }

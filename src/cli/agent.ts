@@ -10,7 +10,7 @@ import { PrismaAdapter } from "../adapters/database/PrismaAdapter.js";
 import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { Metrics } from "../domain/entities/Metrics.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
-import type { RepoRootEntry } from "../ports/RepoApiPort.js";
+import type { RepoReleaseInfo, RepoRootEntry } from "../ports/RepoApiPort.js";
 import {
   buildRetrievalQueries,
   buildBroaderSearchQuery,
@@ -46,6 +46,7 @@ type RepoContext = {
   verifiedOpenIssues: number;
   readme: string | null;
   rootContents: RepoRootEntry[];
+  latestRelease: RepoReleaseInfo | null;
 };
 
 type ScoutSelectionContext = {
@@ -75,6 +76,7 @@ type AnalyzedRepo = {
   error: string | null;
   readme: string | null;
   rootContents: RepoRootEntry[];
+  latestRelease: RepoReleaseInfo | null;
 };
 
 type RankedShortlistItem = {
@@ -505,6 +507,17 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
       Number(rootNames.has(".env.example")) +
       Number(rootNames.has("package.json") || rootNames.has("pyproject.toml") || rootNames.has("requirements.txt")) +
       Number([...rootNames].some((name) => name.startsWith(".github")));
+    const releaseBonus =
+      item.latestRelease
+        ? Math.max(
+            0,
+            Math.floor(
+              2 -
+                (Date.now() - item.latestRelease.publishedAt.getTime()) /
+                  (365 * 24 * 60 * 60 * 1000)
+            )
+          )
+        : 0;
     const frameworkLike = /\b(framework|sdk|library|toolkit|platform|starter)\b/i.test(
       item.search.description ?? ""
     );
@@ -574,7 +587,14 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
         : 0;
 
     const weightedScore =
-      fitScore + adoptionRubric + maintenanceRubric + maturityRubric + bonusRubric + setupRubric + descriptorBonus;
+      fitScore +
+      adoptionRubric +
+      maintenanceRubric +
+      maturityRubric +
+      bonusRubric +
+      setupRubric +
+      Math.min(1, releaseBonus) +
+      descriptorBonus;
 
     const whyParts: string[] = [];
     if (fitScore >= 3) whyParts.push(`most direct fit for ${prompt.label}`);
@@ -588,6 +608,7 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
     if (readmeFit >= 1) whyParts.push("README reinforces the use case");
     if (topicFit >= 1) whyParts.push("repo topics match the prompt");
     if (setupRubric >= 1) whyParts.push("setup signals look credible");
+    if (releaseBonus >= 1) whyParts.push("release signal is present");
     if (mcpQuery && mcpRelevance >= 2) whyParts.push("clear MCP/coding relevance");
 
     let tradeoff: string | null = null;
@@ -596,6 +617,7 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
     else if (fitType === "niche option") tradeoff = "lower adoption signal than the top picks";
     else if (repoAgeDays < 180) tradeoff = "project is still relatively new";
     else if (setupSignals === 0) tradeoff = "setup signals are limited from the root snapshot";
+    else if (!item.latestRelease) tradeoff = "no clear release signal from GitHub releases";
     else if (fitScore < 2) tradeoff = "fit is broader than the exact prompt";
 
     let bestFor = prompt.bestFor[fitType];
@@ -844,7 +866,7 @@ async function buildRepoContext(
   analyzeRepo: AnalyzeRepo,
   repo: SearchResult
 ): Promise<RepoContext> {
-  const [metrics, repoData, languages, contributors, verifiedOpenIssues, readme, rootContents] = await Promise.all([
+  const [metrics, repoData, languages, contributors, verifiedOpenIssues, readme, rootContents, latestRelease] = await Promise.all([
     analyzeRepo.execute(repo.owner, repo.name, true),
     githubAdapter.getRepo(repo.owner, repo.name),
     githubAdapter.getLanguages(repo.owner, repo.name),
@@ -852,6 +874,7 @@ async function buildRepoContext(
     githubAdapter.getIssues(repo.owner, repo.name),
     githubAdapter.getReadme(repo.owner, repo.name),
     githubAdapter.getRootContents(repo.owner, repo.name),
+    githubAdapter.getLatestRelease(repo.owner, repo.name),
   ]);
 
   return {
@@ -871,6 +894,7 @@ async function buildRepoContext(
     verifiedOpenIssues,
     readme,
     rootContents,
+    latestRelease,
   };
 }
 
@@ -967,6 +991,9 @@ async function writeAnalysisReport(context: RepoContext): Promise<void> {
         .join(" ")
         .slice(0, 500)
     : null;
+  const latestReleaseLine = context.latestRelease
+    ? `- Latest Release: ${context.latestRelease.tagName} (${context.latestRelease.publishedAt.toISOString()})`
+    : "- Latest Release: none detected";
 
   const selectedSection = scoutContext
     ? [
@@ -1035,6 +1062,7 @@ async function writeAnalysisReport(context: RepoContext): Promise<void> {
     `- Created At: ${context.repoData.createdAt.toISOString()}`,
     `- Last Push: ${context.repoData.pushedAt.toISOString()}`,
     `- Forks: ${context.repoData.forks.toLocaleString()}`,
+    latestReleaseLine,
     "",
     "## Metrics Snapshot",
     "",
@@ -1244,12 +1272,13 @@ async function analyzePickedRepos(
   for (const item of picked) {
     output.write(`Analyzing ${item.fullName}...\n`);
     try {
-      const [metrics, readme, rootContents] = await Promise.all([
+      const [metrics, readme, rootContents, latestRelease] = await Promise.all([
         analyzeRepo.execute(item.owner, item.name, false),
         githubAdapter.getReadme(item.owner, item.name),
         githubAdapter.getRootContents(item.owner, item.name),
+        githubAdapter.getLatestRelease(item.owner, item.name),
       ]);
-      rows.push({ search: item, metrics, error: null, readme, rootContents });
+      rows.push({ search: item, metrics, error: null, readme, rootContents, latestRelease });
     } catch (err: unknown) {
       rows.push({
         search: item,
@@ -1257,6 +1286,7 @@ async function analyzePickedRepos(
         error: err instanceof Error ? err.message : "Unknown error",
         readme: null,
         rootContents: [],
+        latestRelease: null,
       });
     }
   }
@@ -1390,7 +1420,14 @@ async function main() {
       const shortlist = rankShortlist(
         analyzed.length > 0
           ? analyzed
-          : candidates.map((search) => ({ search, metrics: null, error: null, readme: null, rootContents: [] })),
+          : candidates.map((search) => ({
+              search,
+              metrics: null,
+              error: null,
+              readme: null,
+              rootContents: [],
+              latestRelease: null,
+            })),
         intent
       ).slice(0, plan.search.top);
       await writeScoutReport(shortlist, response);
