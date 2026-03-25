@@ -73,6 +73,8 @@ type AnalyzedRepo = {
   search: SearchResult;
   metrics: Metrics | null;
   error: string | null;
+  readme: string | null;
+  rootContents: RepoRootEntry[];
 };
 
 type RankedShortlistItem = {
@@ -237,6 +239,9 @@ function tokenizeRepo(item: AnalyzedRepo): Set<string> {
       item.search.name,
       item.search.description ?? "",
       getPrimaryLanguage(item),
+      item.readme ?? "",
+      ...item.rootContents.map((entry) => entry.name),
+      ...(item.search.topics ?? []),
     ]
       .join(" ")
       .toLowerCase()
@@ -462,6 +467,12 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
     const stars = item.search.stars;
     const forks = item.search.forks;
     const contributors = getContributorCount(item);
+    const readmeText = (item.readme ?? "").toLowerCase();
+    const rootNames = new Set(item.rootContents.map((entry) => entry.name.toLowerCase()));
+    const readmeFit = intent.purposeTerms.filter((term) => readmeText.includes(term)).length;
+    const topicFit = (item.search.topics ?? []).filter((topic) =>
+      intent.purposeTerms.some((term) => topic.toLowerCase().includes(term))
+    ).length;
     const repoAgeDays = getRepoAgeDays(item);
     const repoAgeMonths = Math.max(1, repoAgeDays / 30);
     const starVelocity = stars / repoAgeMonths;
@@ -488,14 +499,20 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
     const velocityScore = starVelocity >= 500 ? 2 : starVelocity >= 100 ? 1 : 0;
     const maintainabilityScore =
       item.metrics && !item.error ? (item.metrics.openIssues <= 50 ? 2 : item.metrics.openIssues <= 200 ? 1 : 0) : 0;
+    const setupSignals =
+      Number(rootNames.has("dockerfile")) +
+      Number(rootNames.has("docker-compose.yml") || rootNames.has("docker-compose.yaml")) +
+      Number(rootNames.has(".env.example")) +
+      Number(rootNames.has("package.json") || rootNames.has("pyproject.toml") || rootNames.has("requirements.txt")) +
+      Number([...rootNames].some((name) => name.startsWith(".github")));
     const frameworkLike = /\b(framework|sdk|library|toolkit|platform|starter)\b/i.test(
       item.search.description ?? ""
     );
 
     const passesQualityFloor = prompt.strictQualityFloor
       ? ((stars >= 50 && repoAgeDays >= 45 && contributors >= 2) ||
-          (promptFit + mcpRelevance >= 3 && (stars >= 20 || forks >= 5) && repoAgeDays >= 30))
-      : (stars >= 10 || forks >= 2 || contributors >= 2 || repoAgeDays >= 30 || promptFit >= 2);
+          (promptFit + readmeFit + topicFit + mcpRelevance >= 3 && (stars >= 20 || forks >= 5) && repoAgeDays >= 30))
+      : (stars >= 10 || forks >= 2 || contributors >= 2 || repoAgeDays >= 30 || promptFit + readmeFit + topicFit >= 2);
 
     if (!passesQualityFloor) {
       return null;
@@ -503,11 +520,11 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
 
     const fitScore = Math.min(
       3,
-      promptFit + (mcpQuery ? Math.min(2, mcpRelevance) : 0) >= 4
+      promptFit + readmeFit + topicFit + (mcpQuery ? Math.min(2, mcpRelevance) : 0) >= 5
         ? 3
-        : promptFit + (mcpQuery ? Math.min(2, mcpRelevance) : 0) >= 2
+        : promptFit + readmeFit + topicFit + (mcpQuery ? Math.min(2, mcpRelevance) : 0) >= 3
           ? 2
-          : promptFit >= 1 || mcpRelevance >= 1
+          : promptFit >= 1 || readmeFit >= 1 || topicFit >= 1 || mcpRelevance >= 1
             ? 1
             : 0
     );
@@ -532,6 +549,7 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
           ? 1
           : 0;
     const bonusRubric = Math.min(1, maintainabilityScore > 0 || velocityScore > 0 ? 1 : 0);
+    const setupRubric = setupSignals >= 3 ? 1 : 0;
 
     const fitType: RankedShortlistItem["fitType"] =
       fitScore >= 2
@@ -555,7 +573,8 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
               : 0
         : 0;
 
-    const weightedScore = fitScore + adoptionRubric + maintenanceRubric + maturityRubric + bonusRubric + descriptorBonus;
+    const weightedScore =
+      fitScore + adoptionRubric + maintenanceRubric + maturityRubric + bonusRubric + setupRubric + descriptorBonus;
 
     const whyParts: string[] = [];
     if (fitScore >= 3) whyParts.push(`most direct fit for ${prompt.label}`);
@@ -566,6 +585,9 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
     if (adoptionRubric >= 2) whyParts.push("strong adoption");
     if (maturityRubric >= 1) whyParts.push("established repo age");
     if (maintenanceRubric >= 1) whyParts.push("recent maintenance");
+    if (readmeFit >= 1) whyParts.push("README reinforces the use case");
+    if (topicFit >= 1) whyParts.push("repo topics match the prompt");
+    if (setupRubric >= 1) whyParts.push("setup signals look credible");
     if (mcpQuery && mcpRelevance >= 2) whyParts.push("clear MCP/coding relevance");
 
     let tradeoff: string | null = null;
@@ -573,6 +595,7 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
     else if (fitType === "production choice") tradeoff = "broader scope than the most targeted option";
     else if (fitType === "niche option") tradeoff = "lower adoption signal than the top picks";
     else if (repoAgeDays < 180) tradeoff = "project is still relatively new";
+    else if (setupSignals === 0) tradeoff = "setup signals are limited from the root snapshot";
     else if (fitScore < 2) tradeoff = "fit is broader than the exact prompt";
 
     let bestFor = prompt.bestFor[fitType];
@@ -1212,6 +1235,7 @@ class AiBrain {
 }
 
 async function analyzePickedRepos(
+  githubAdapter: GithubAdapter,
   analyzeRepo: AnalyzeRepo,
   picked: SearchResult[]
 ): Promise<AnalyzedRepo[]> {
@@ -1220,13 +1244,19 @@ async function analyzePickedRepos(
   for (const item of picked) {
     output.write(`Analyzing ${item.fullName}...\n`);
     try {
-      const metrics = await analyzeRepo.execute(item.owner, item.name, false);
-      rows.push({ search: item, metrics, error: null });
+      const [metrics, readme, rootContents] = await Promise.all([
+        analyzeRepo.execute(item.owner, item.name, false),
+        githubAdapter.getReadme(item.owner, item.name),
+        githubAdapter.getRootContents(item.owner, item.name),
+      ]);
+      rows.push({ search: item, metrics, error: null, readme, rootContents });
     } catch (err: unknown) {
       rows.push({
         search: item,
         metrics: null,
         error: err instanceof Error ? err.message : "Unknown error",
+        readme: null,
+        rootContents: [],
       });
     }
   }
@@ -1337,7 +1367,7 @@ async function main() {
       const hadCandidates = candidates.length > 0;
 
       output.write("Analyzing results...\n");
-      const analyzed = await analyzePickedRepos(analyzeRepo, candidates);
+      const analyzed = await analyzePickedRepos(githubAdapter, analyzeRepo, candidates);
       const response =
         analyzed.length === 0
           ? intent.confidence < 0.4
@@ -1358,7 +1388,9 @@ async function main() {
       }
 
       const shortlist = rankShortlist(
-        analyzed.length > 0 ? analyzed : candidates.map((search) => ({ search, metrics: null, error: null })),
+        analyzed.length > 0
+          ? analyzed
+          : candidates.map((search) => ({ search, metrics: null, error: null, readme: null, rootContents: [] })),
         intent
       ).slice(0, plan.search.top);
       await writeScoutReport(shortlist, response);
