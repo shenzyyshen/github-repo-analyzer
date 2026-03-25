@@ -100,6 +100,11 @@ type ShortlistHistoryEntry = {
   repos: SeenRepoEntry[];
 };
 
+type SessionState = {
+  seenRepos: SeenRepoEntry[];
+  shortlistHistory: ShortlistHistoryEntry[];
+};
+
 type SelectionChoice =
   | { kind: "pick"; index: number }
   | { kind: "none" }
@@ -115,6 +120,7 @@ type TextChoice =
   | { kind: "exit" };
 
 const INVALID_SELECTION_MESSAGE = "Enter a number between 1-5, or type 'none', 're run', 'seen', 'history', or 'quit'.";
+const SESSION_FILE = ".codex/session.json";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -877,6 +883,24 @@ function renderShortlistHistory(entries: ShortlistHistoryEntry[]): string {
   ].join("\n");
 }
 
+async function loadSessionState(): Promise<SessionState> {
+  try {
+    const raw = await readFile(SESSION_FILE, "utf8");
+    const parsed = JSON.parse(raw) as Partial<SessionState>;
+    return {
+      seenRepos: Array.isArray(parsed.seenRepos) ? parsed.seenRepos : [],
+      shortlistHistory: Array.isArray(parsed.shortlistHistory) ? parsed.shortlistHistory : [],
+    };
+  } catch {
+    return { seenRepos: [], shortlistHistory: [] };
+  }
+}
+
+async function saveSessionState(state: SessionState): Promise<void> {
+  await mkdir(".codex", { recursive: true });
+  await writeFile(SESSION_FILE, JSON.stringify(state, null, 2), "utf8");
+}
+
 async function writeScoutReport(results: RankedShortlistItem[], summary: string): Promise<void> {
   await mkdir("reports", { recursive: true });
 
@@ -1522,10 +1546,11 @@ async function main() {
   const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter);
   const brain = new AiBrain();
   const rl = createInterface({ input, output });
+  const persistedSession = await loadSessionState();
   const history: Turn[] = [];
   const rejectedRepos = new Set<string>();
-  const seenRepos: SeenRepoEntry[] = [];
-  const shortlistHistory: ShortlistHistoryEntry[] = [];
+  const seenRepos: SeenRepoEntry[] = [...persistedSession.seenRepos];
+  const shortlistHistory: ShortlistHistoryEntry[] = [...persistedSession.shortlistHistory];
   let pendingInput: string | null = null;
 
   output.write("\x1bc");
@@ -1656,6 +1681,7 @@ async function main() {
       const shortlistEntries = buildSeenEntries(userInput, shortlist);
       seenRepos.push(...shortlistEntries);
       shortlistHistory.push({ prompt: userInput, repos: shortlistEntries });
+      await saveSessionState({ seenRepos, shortlistHistory });
       await writeScoutReport(shortlist, response);
       output.write(`${renderShortlist(shortlist)}\n`);
 
