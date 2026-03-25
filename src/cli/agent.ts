@@ -11,6 +11,7 @@ import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { Metrics } from "../domain/entities/Metrics.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
 import {
+  buildRetrievalQueries,
   buildBroaderSearchQuery,
   buildClarificationPrompt,
   inferFilters,
@@ -337,6 +338,27 @@ function preselectCandidates(
     .sort((a, b) => b.prefilterScore - a.prefilterScore);
 
   return scored.slice(0, candidatePoolSize).map((entry) => entry.repo);
+}
+
+async function searchMergedCandidates(
+  githubAdapter: GithubAdapter,
+  search: NonNullable<SearchPlan["search"]>,
+  intent: ParsedIntent
+): Promise<SearchResult[]> {
+  const queries = buildRetrievalQueries(intent, search.query);
+  const merged = new Map<string, SearchResult>();
+
+  for (const query of queries) {
+    const effectiveQuery = buildGitHubQuery({ ...search, query });
+    const batch = await githubAdapter.searchRepos(effectiveQuery, search.sort, 100);
+    for (const repo of batch) {
+      if (!merged.has(repo.fullName)) {
+        merged.set(repo.fullName, repo);
+      }
+    }
+  }
+
+  return [...merged.values()];
 }
 
 type PromptProfile = {
@@ -1195,7 +1217,7 @@ async function main() {
 
       output.write("Searching GitHub...\n");
       const query = buildGitHubQuery(effectiveSearch);
-      let results = await githubAdapter.searchRepos(query, effectiveSearch.sort, 100);
+      let results = await searchMergedCandidates(githubAdapter, effectiveSearch, intent);
       if (results.length === 0) {
         if (intent.confidence < 0.4) {
           const filterText = renderAppliedFilters(inferred.applied);
@@ -1212,21 +1234,13 @@ async function main() {
         const broaderQuery = buildBroaderSearchQuery(intent);
         if (broaderQuery && broaderQuery !== effectiveSearch.query) {
           output.write(`Retrying with broader query: ${broaderQuery}\n`);
-          results = await githubAdapter.searchRepos(
-            buildGitHubQuery({ ...effectiveSearch, query: broaderQuery }),
-            effectiveSearch.sort,
-            100
-          );
+          results = await searchMergedCandidates(githubAdapter, { ...effectiveSearch, query: broaderQuery }, intent);
         }
 
         const relaxedQuery = normalizeSearchQuery(effectiveSearch.query);
         if (results.length === 0 && relaxedQuery && relaxedQuery !== effectiveSearch.query) {
           output.write(`Retrying with broader query: ${relaxedQuery}\n`);
-          results = await githubAdapter.searchRepos(
-            buildGitHubQuery({ ...effectiveSearch, query: relaxedQuery }),
-            effectiveSearch.sort,
-            100
-          );
+          results = await searchMergedCandidates(githubAdapter, { ...effectiveSearch, query: relaxedQuery }, intent);
         }
 
         if (results.length === 0) {
@@ -1240,11 +1254,7 @@ async function main() {
             sort: "stars" as const,
           };
           output.write(`Retrying with relaxed filters: ${fallbackQuery}\n`);
-          results = await githubAdapter.searchRepos(
-            buildGitHubQuery(relaxedSearch),
-            relaxedSearch.sort,
-            100
-          );
+          results = await searchMergedCandidates(githubAdapter, relaxedSearch, intent);
         }
       }
       results = results.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));

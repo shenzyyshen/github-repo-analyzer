@@ -64,6 +64,51 @@ export function buildBroaderSearchQuery(intent: ParsedIntent): string | null {
   return uniqueTerms.join(" ");
 }
 
+export function buildRetrievalQueries(intent: ParsedIntent, baseQuery: string): string[] {
+  const queries = new Set<string>();
+  const normalizedBase = baseQuery.trim();
+  if (normalizedBase) {
+    queries.add(normalizedBase);
+  }
+
+  if (intent.normalizedQuery && intent.normalizedQuery !== normalizedBase) {
+    queries.add(intent.normalizedQuery);
+  }
+
+  const broader = buildBroaderSearchQuery(intent);
+  if (broader && broader !== normalizedBase) {
+    queries.add(broader);
+  }
+
+  if (intent.concepts.length > 0) {
+    const conceptOnly = [...new Set(intent.concepts.flatMap((concept) => conceptBroadTerms(concept)))]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    if (conceptOnly && conceptOnly !== normalizedBase) {
+      queries.add(conceptOnly);
+    }
+  }
+
+  if (intent.purposeTerms.length > 0) {
+    const purposeFocused = intent.purposeTerms.slice(0, 4).join(" ").trim();
+    if (purposeFocused && purposeFocused !== normalizedBase) {
+      queries.add(purposeFocused);
+    }
+  }
+
+  if (intent.boostTerms.length > 0 && intent.purposeTerms.length > 0) {
+    const hybrid = [...new Set([...intent.purposeTerms.slice(0, 3), ...intent.boostTerms.slice(0, 4)])]
+      .join(" ")
+      .trim();
+    if (hybrid && hybrid !== normalizedBase) {
+      queries.add(hybrid);
+    }
+  }
+
+  return [...queries].filter(Boolean).slice(0, 5);
+}
+
 const STOP_WORDS = new Set([
   "find",
   "top",
