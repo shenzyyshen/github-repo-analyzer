@@ -92,6 +92,7 @@ type RankedShortlistItem = {
 type SelectionChoice =
   | { kind: "pick"; index: number }
   | { kind: "none" }
+  | { kind: "rerun" }
   | { kind: "back" }
   | { kind: "exit" };
 
@@ -100,7 +101,7 @@ type TextChoice =
   | { kind: "back" }
   | { kind: "exit" };
 
-const INVALID_SELECTION_MESSAGE = "Enter a number between 1-5, or type 'none' / 'quit'.";
+const INVALID_SELECTION_MESSAGE = "Enter a number between 1-5, or type 'none', 're run', or 'quit'.";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -707,18 +708,30 @@ function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedSho
 
   const ranked: RankedShortlistItem[] = [];
   const seenTypes = new Set<string>();
+  const seenTradeoffs = new Map<string, number>();
+  const seenRiskPatterns = new Map<string, number>();
   const pool = [...scored];
 
   while (pool.length > 0) {
     pool.sort((a, b) => {
       const aPenalty = seenTypes.has(a.fitType) ? 1.25 : 0;
       const bPenalty = seenTypes.has(b.fitType) ? 1.25 : 0;
-      return b.score - bPenalty - (a.score - aPenalty);
+      const aTradeoffPenalty = a.tradeoff ? (seenTradeoffs.get(a.tradeoff) ?? 0) * 1.1 : 0;
+      const bTradeoffPenalty = b.tradeoff ? (seenTradeoffs.get(b.tradeoff) ?? 0) * 1.1 : 0;
+      const aRiskPenalty = a.risk ? (seenRiskPatterns.get(a.risk) ?? 0) * 0.9 : 0;
+      const bRiskPenalty = b.risk ? (seenRiskPatterns.get(b.risk) ?? 0) * 0.9 : 0;
+      return (b.score - bPenalty - bTradeoffPenalty - bRiskPenalty) - (a.score - aPenalty - aTradeoffPenalty - aRiskPenalty);
     });
     const next = pool.shift();
     if (!next) break;
     ranked.push(next);
     seenTypes.add(next.fitType);
+    if (next.tradeoff) {
+      seenTradeoffs.set(next.tradeoff, (seenTradeoffs.get(next.tradeoff) ?? 0) + 1);
+    }
+    if (next.risk) {
+      seenRiskPatterns.set(next.risk, (seenRiskPatterns.get(next.risk) ?? 0) + 1);
+    }
   }
 
   return ranked;
@@ -907,6 +920,10 @@ async function promptForSelection(
 
     if (selection === "none") {
       return { kind: "none" };
+    }
+
+    if (selection === "re run" || selection === "rerun") {
+      return { kind: "rerun" };
     }
 
     const index = Number(selection);
@@ -1461,7 +1478,7 @@ async function main() {
 
   try {
     outer: while (true) {
-      const userInput = pendingInput ?? (await rl.question("> ")).trim();
+      const userInput: string = pendingInput ?? (await rl.question("> ")).trim();
       pendingInput = null;
       if (!userInput) continue;
       if (userInput === "exit" || userInput === "quit") {
@@ -1614,6 +1631,16 @@ async function main() {
             pendingInput = refinement.value;
             continue outer;
           }
+        }
+
+        if (selection.kind === "rerun") {
+          shortlist.forEach((ranked) => rejectedRepos.add(ranked.item.search.fullName));
+          history.push({
+            role: "assistant",
+            content: `Previous Search (rejected): ${buildShortlistNames(shortlist)}`,
+          });
+          pendingInput = userInput;
+          continue outer;
         }
 
         const chosen = shortlist[selection.index].item.search;
