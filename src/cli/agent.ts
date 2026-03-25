@@ -89,10 +89,23 @@ type RankedShortlistItem = {
   fitType: "direct match" | "production choice" | "adaptable framework" | "niche option" | "balanced option";
 };
 
+type SeenRepoEntry = {
+  prompt: string;
+  fullName: string;
+  url: string;
+};
+
+type ShortlistHistoryEntry = {
+  prompt: string;
+  repos: SeenRepoEntry[];
+};
+
 type SelectionChoice =
   | { kind: "pick"; index: number }
   | { kind: "none" }
   | { kind: "rerun" }
+  | { kind: "seen" }
+  | { kind: "history" }
   | { kind: "back" }
   | { kind: "exit" };
 
@@ -101,7 +114,7 @@ type TextChoice =
   | { kind: "back" }
   | { kind: "exit" };
 
-const INVALID_SELECTION_MESSAGE = "Enter a number between 1-5, or type 'none', 're run', or 'quit'.";
+const INVALID_SELECTION_MESSAGE = "Enter a number between 1-5, or type 'none', 're run', 'seen', 'history', or 'quit'.";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -832,6 +845,38 @@ function buildShortlistNames(results: Array<AnalyzedRepo | RankedShortlistItem>)
     .join(", ");
 }
 
+function buildSeenEntries(prompt: string, shortlist: RankedShortlistItem[]): SeenRepoEntry[] {
+  return shortlist.map((ranked) => ({
+    prompt,
+    fullName: ranked.item.search.fullName,
+    url: buildRepoUrl(ranked.item.search.fullName),
+  }));
+}
+
+function renderSeenRepos(entries: SeenRepoEntry[]): string {
+  if (entries.length === 0) {
+    return "No repos have been shown in this session yet.\n";
+  }
+
+  return [
+    "Seen repos:",
+    ...entries.map((entry, index) => `${index + 1}. ${entry.prompt}\n   ${entry.fullName}\n   ${entry.url}`),
+    "",
+  ].join("\n");
+}
+
+function renderShortlistHistory(entries: ShortlistHistoryEntry[]): string {
+  if (entries.length === 0) {
+    return "No shortlist history is available yet.\n";
+  }
+
+  return [
+    "Shortlist history:",
+    ...entries.map((entry, index) => `${index + 1}. ${entry.prompt}\n   ${entry.repos.map((repo) => repo.fullName).join(", ")}`),
+    "",
+  ].join("\n");
+}
+
 async function writeScoutReport(results: RankedShortlistItem[], summary: string): Promise<void> {
   await mkdir("reports", { recursive: true });
 
@@ -924,6 +969,14 @@ async function promptForSelection(
 
     if (selection === "re run" || selection === "rerun") {
       return { kind: "rerun" };
+    }
+
+    if (selection === "seen") {
+      return { kind: "seen" };
+    }
+
+    if (selection === "history") {
+      return { kind: "history" };
     }
 
     const index = Number(selection);
@@ -1471,6 +1524,8 @@ async function main() {
   const rl = createInterface({ input, output });
   const history: Turn[] = [];
   const rejectedRepos = new Set<string>();
+  const seenRepos: SeenRepoEntry[] = [];
+  const shortlistHistory: ShortlistHistoryEntry[] = [];
   let pendingInput: string | null = null;
 
   output.write("\x1bc");
@@ -1598,6 +1653,9 @@ async function main() {
             })),
         intent
       ).slice(0, plan.search.top);
+      const shortlistEntries = buildSeenEntries(userInput, shortlist);
+      seenRepos.push(...shortlistEntries);
+      shortlistHistory.push({ prompt: userInput, repos: shortlistEntries });
       await writeScoutReport(shortlist, response);
       output.write(`${renderShortlist(shortlist)}\n`);
 
@@ -1612,11 +1670,21 @@ async function main() {
           break;
         }
 
+        if (selection.kind === "seen") {
+          output.write(`${renderSeenRepos(seenRepos)}\n`);
+          continue;
+        }
+
+        if (selection.kind === "history") {
+          output.write(`${renderShortlistHistory(shortlistHistory)}\n`);
+          continue;
+        }
+
         if (selection.kind === "none") {
           shortlist.forEach((ranked) => rejectedRepos.add(ranked.item.search.fullName));
           history.push({
             role: "assistant",
-            content: `Previous Search (rejected): ${buildShortlistNames(shortlist)}`,
+            content: `Previous Shortlist (set aside for now): ${buildShortlistNames(shortlist)}`,
           });
 
           while (true) {
@@ -1637,7 +1705,7 @@ async function main() {
           shortlist.forEach((ranked) => rejectedRepos.add(ranked.item.search.fullName));
           history.push({
             role: "assistant",
-            content: `Previous Search (rejected): ${buildShortlistNames(shortlist)}`,
+            content: `Previous Shortlist (set aside for now): ${buildShortlistNames(shortlist)}`,
           });
           pendingInput = userInput;
           continue outer;
