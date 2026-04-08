@@ -1,17 +1,17 @@
 import type { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { RepoApiPort } from "../ports/RepoApiPort.js";
-import type { SearchResult } from "../domain/entities/SearchResult.js";
-import { createSpinner, renderSummary, renderTable, type AnalyzeRow } from "./display.js";
-import { RateLimitError } from "../adapters/github/GithubAdapter.js";
 import type { QueryTranslator } from "../ai/QueryTranslator.js";
+import { renderStagedSearch, runStagedSearch, type IntentMode } from "./stagedSearch.js";
 
 type SearchOptions = {
   language?: string;
   minStars?: number;
   since?: string;
+  mode?: IntentMode;
   sort?: "stars" | "updated" | "forks";
   random: boolean;
   json: boolean;
+  explain: boolean;
   top: number;
 };
 
@@ -32,67 +32,36 @@ export class SearchCommand {
         ? options.minStars
         : translation.minStars ?? 0;
     const sort = options.sort ?? translation.sort ?? "stars";
-    const q = this.buildQuery(translation.query, language, minStars, since);
+    const q = translation.query;
 
-    process.stdout.write("Searching GitHub...\n");
-    const results = await this.repoApiPort.searchRepos(q, sort, 100);
+    process.stdout.write("Running staged retrieval and ranking...\n");
+    const result = await runStagedSearch(
+      this.repoApiPort,
+      this.analyzeRepo,
+      query,
+      {
+        query: q,
+        language: language ?? null,
+        minStars,
+        since,
+        license: null,
+        sort,
+        top: options.top,
+        random: options.random,
+      },
+      {
+        requestedMode: options.mode,
+        top: options.top,
+        random: options.random,
+        explain: options.explain,
+      }
+    );
 
     if (options.json) {
-      process.stdout.write(JSON.stringify(results, null, 2));
-      return;
+      process.stdout.write(JSON.stringify(result, null, 2));
+    } else {
+      process.stdout.write(renderStagedSearch(result, options.explain));
     }
-
-    const picked = options.random
-      ? this.pickRandom(results, options.top)
-      : results.slice(0, options.top);
-
-    process.stdout.write("Analyzing results...\n");
-    const rows: AnalyzeRow[] = [];
-    for (let i = 0; i < picked.length; i += 1) {
-      const item = picked[i];
-      const spinner = createSpinner(`Analyzing ${item.fullName}…`);
-      try {
-        const metrics = await this.analyzeRepo.execute(item.owner, item.name, false);
-        rows.push({ rank: i + 1, search: item, metrics });
-        spinner.succeed(`Analyzed ${item.fullName}`);
-      } catch (err: unknown) {
-        const message =
-          err instanceof RateLimitError
-            ? err.message
-            : err instanceof Error
-            ? err.message
-            : "Unknown error";
-        rows.push({ rank: i + 1, search: item, error: message });
-        spinner.fail(`Failed ${item.fullName}: ${message}`);
-      }
-    }
-
-    process.stdout.write(renderTable(rows));
-    process.stdout.write("\n");
-    process.stdout.write(renderSummary(rows.length));
-    process.stdout.write("\n");
-  }
-
-  private buildQuery(
-    query: string,
-    language: string | undefined,
-    minStars: number,
-    since: string
-  ): string {
-    const parts: string[] = [query];
-    if (language) parts.push(`language:${language}`);
-    if (minStars > 0) parts.push(`stars:>${minStars}`);
-    if (since) parts.push(`pushed:>${since}`);
-    return parts.join(" ");
-  }
-
-  private pickRandom(results: SearchResult[], top: number): SearchResult[] {
-    const copy = [...results];
-    for (let i = copy.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [copy[i], copy[j]] = [copy[j], copy[i]];
-    }
-    return copy.slice(0, top);
   }
 
   private getDefaultSince(): string {

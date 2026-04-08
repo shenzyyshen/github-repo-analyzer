@@ -9,6 +9,8 @@ export interface SearchResult {
   description: string | null;
   stars: number;
   forks: number;
+  archived: boolean;
+  isFork: boolean;
   language: string | null;
   createdAt: Date;
   pushedAt: Date;

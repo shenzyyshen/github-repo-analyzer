@@ -25,14 +25,20 @@ async function main() {
     .option("--language <lang>", "filter by language")
     .option("--min-stars <n>", "minimum star count")
     .option("--since <date>", "pushed after date, YYYY-MM-DD")
+    .option("--mode <mode>", "best_match | best_shortlist")
     .option("--sort <field>", "stars | updated | forks")
     .option("--random", "pick random results from first 100")
     .option("--json", "output raw JSON and skip analyze")
+    .option("--explain", "show scoring breakdown for returned repos")
     .option("--top <n>", "how many results to show/analyze (max 10)", "5")
     .action(async (query, options) => {
       const top = Math.min(Number(options.top) || 5, 10);
       const minStars =
         options.minStars !== undefined ? Number(options.minStars) || 0 : undefined;
+      const mode =
+        options.mode && ["best_match", "best_shortlist"].includes(options.mode)
+          ? options.mode
+          : undefined;
       const sort =
         options.sort && ["stars", "updated", "forks"].includes(options.sort)
           ? options.sort
@@ -53,9 +59,11 @@ async function main() {
           language: options.language,
           minStars,
           since: options.since,
+          mode,
           sort,
           random: Boolean(options.random),
           json: Boolean(options.json),
+          explain: Boolean(options.explain),
           top,
         });
       } finally {

@@ -9,6 +9,8 @@ export interface Repo {
   description: string | null;
   stars: number;
   forks: number;
+  archived: boolean;
+  isFork: boolean;
   openIssues: number;
   defaultBranch: string;
   pushedAt: Date;

@@ -1,88 +1,61 @@
 # Repo Analysis
 
-Generated: 2026-03-25T23:09:51.667Z
-
-## Analysis Summary
-
-getmaxun/maxun was shortlisted because the scout identified it as a strong candidate for this request, with particular emphasis on: most direct fit for self-hosted; strong adoption; established repo age; recent maintenance; README reinforces the use case; repo topics match the prompt; setup signals look credible; release signal is present.
-
-## First Impression
-
-🔥 The open-source no-code platform for web scraping, crawling, search and AI data extraction • Turn websites into structured APIs in minutes 🔥  Likely stack: Node.js / JavaScript or TypeScript, TypeScript, Docker Compose, GitHub Actions / CI config. Setup quality signals: README has meaningful setup/documentation content, docker-compose present, CI/workflow config present. A GitHub release exists (v0.0.36), which is a useful maturity signal.
-
-## Why This Repo Was Selected
-- Scout score: 10/10
-- Scout rationale: most direct fit for self-hosted; strong adoption; established repo age; recent maintenance; README reinforces the use case; repo topics match the prompt; setup signals look credible; release signal is present
-- Current repo description: 🔥 The open-source no-code platform for web scraping, crawling, search and AI data extraction • Turn websites into structured APIs in minutes 🔥 
-- README support: <h2 align="center"> <div> <a href="https://www.maxun.dev/?ref=ghread"> <img src="/src/assets/maxunlogo.png" width="70" /> <br> Maxun
-
-## Analysis Focus
-
-This analysis emphasizes the areas highlighted by the scout: most direct fit for self-hosted; strong adoption; established repo age; recent maintenance; README reinforces the use case; repo topics match the prompt; setup signals look credible; release signal is present.
-
 ## Project Summary
 
-getmaxun/maxun is a TypeScript repository with 15,309 stars and 25 contributors.
-🔥 The open-source no-code platform for web scraping, crawling, search and AI data extraction • Turn websites into structured APIs in minutes 🔥 
+This repository has evolved from a GitHub metrics analyzer into a terminal-first AI-assisted GitHub repo discovery and curation tool. The current product vision is natural-language repo scouting: translate a user prompt into several GitHub searches, broaden retrieval, rank candidates, explain tradeoffs and risks, and optionally generate a deeper markdown report for one selected repo.
 
-## Tech Stack Signals
+The analyzer output is therefore not code-quality scoring or dependency graphs. The lightweight/core analyzer returns repo metadata and activity metrics such as stars, 24h star growth, language breakdown, open issues, contributors, and last commit. The deeper scout-driven analysis writes a markdown report with project summary, stack signals, structure overview, setup signals, risks, README snapshot, repository metadata, and metrics snapshot.
 
-- Node.js / JavaScript or TypeScript
-- TypeScript
-- Docker Compose
-- GitHub Actions / CI config
+The most likely intended users are developers, technical founders, DevRel, and internal platform/tooling teams who need to discover and compare open-source repos quickly. The terminal-first workflow and MCP support suggest this is optimized for technical users rather than a broad consumer audience.
+
+## Tech Stack
+
+- TypeScript on Node.js 20+ ([package.json](/Users/shenmay/Projects_/repo-metrics-hex/package.json))
+- Express for HTTP delivery ([src/server/express.ts](/Users/shenmay/Projects_/repo-metrics-hex/src/server/express.ts))
+- MCP server over stdio for AI-client integration ([src/server/mcp.ts](/Users/shenmay/Projects_/repo-metrics-hex/src/server/mcp.ts))
+- Octokit GitHub REST client ([src/adapters/github/GithubAdapter.ts](/Users/shenmay/Projects_/repo-metrics-hex/src/adapters/github/GithubAdapter.ts))
+- Prisma + PostgreSQL for persistence ([src/adapters/database/PrismaAdapter.ts](/Users/shenmay/Projects_/repo-metrics-hex/src/adapters/database/PrismaAdapter.ts), [prisma/schema.prisma](/Users/shenmay/Projects_/repo-metrics-hex/prisma/schema.prisma))
+- OpenAI SDK is present and used in the conversational CLI planner ([src/cli/agent.ts](/Users/shenmay/Projects_/repo-metrics-hex/src/cli/agent.ts))
 
 ## Structure Overview
 
-- .dockerignore
-- .github
-- .gitignore
-- .sequelizerc
-- browser
-- CONTRIBUTING.md
-- docker-compose.yml
-- docker-entrypoint.sh
-- Dockerfile.backend
-- Dockerfile.frontend
-- docs
-- ENVEXAMPLE
-- index.html
-- legacy
-- LICENSE
+- Domain entities and use cases live in `src/domain/`
+- Ports live in `src/ports/`
+- Driven adapters live in `src/adapters/`
+- Driving adapters / delivery surfaces live in `src/cli/` and `src/server/`
+- App wiring happens in `src/index.ts`
 
-## Setup Quality Signals
+Main ports:
+- `RepoApiPort`: repo metadata, languages, issues, contributors, README, root contents, latest release, search
+- `MetricsRepoPort`: save metrics, load metrics, trending queries
 
-- README has meaningful setup/documentation content
-- docker-compose present
-- CI/workflow config present
+Main adapters:
+- GitHub adapter via Octokit
+- Prisma/PostgreSQL adapter
+- CLI adapter
+- Express API adapter
+- MCP adapter
 
-## README Snapshot
+## Strengths
 
-<h2 align="center"> <div> <a href="https://www.maxun.dev/?ref=ghread"> <img src="/src/assets/maxunlogo.png" width="70" /> <br> Maxun
+- Clear hexagonal separation between domain, ports, adapters, and delivery surfaces
+- Strong product direction: retrieval breadth + shortlist precision + explainable tradeoffs
+- Same core capabilities exposed through CLI, REST, and MCP
+- AI is used where it helps most: prompt interpretation/planning, with GitHub retrieval and ranking still grounded in explicit signals
+- Repo analysis output is decision-oriented for choosing repos, not just raw metrics dumping
 
-## Repository Metadata
+## Gaps
 
-- Repo: getmaxun/maxun
-- GitHub URL: https://github.com/getmaxun/maxun
-- Default Branch: develop
-- Created At: 2023-10-23T21:40:19.000Z
-- Last Push: 2026-03-25T12:10:52.000Z
-- Forks: 1,256
-- Latest Release: v0.0.36 (2026-03-24T17:40:31.000Z)
+- The formal domain use cases in `src/domain/usecases/` are still relatively narrow compared with the richer scout logic in `src/cli/agent.ts`
+- No evidence in the repo of production usage metrics, telemetry, or real user adoption numbers
+- No LICENSE file exists even though README mentions MIT
+- README/docs still reflect two overlapping product narratives: earlier "repo analyzer" and current "repo scout"
+- No clear evidence this is deployed live beyond local/API/MCP runtime instructions
 
-## Metrics Snapshot
+## Quick Wins
 
-- Stars: 15,309
-- 24h Growth: 0 (0.00%)
-- Open Issues: 74
-- Contributors: 25
-- Last Commit: 2026-03-25T12:10:52.000Z
-
-## Language Breakdown
-
-- TypeScript: 2,053,785
-- JavaScript: 139,882
-- CSS: 1,798
-- Shell: 1,197
-- HTML: 790
-- Dockerfile: 684
+- Unify the narrative across README and docs around the current scout/discovery product
+- Promote shortlist ranking and deep report generation into clearer service/domain modules rather than concentrating them in the CLI agent
+- Add a real `LICENSE` file if the project is meant to be open source
+- Add lightweight usage instrumentation if impact metrics are important
+- Clarify intended primary user segment in README: developer scout tool, founder research tool, or internal tooling assistant
