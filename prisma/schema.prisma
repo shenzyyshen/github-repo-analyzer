@@ -37,3 +37,152 @@ model Metrics {
   @@index([analyzedAt])
   @@index([repoOwner, repoName])
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6 — intelligence data model
+// ---------------------------------------------------------------------------
+
+/// Append-only time-series snapshot of raw GitHub metadata per repo.
+/// Ingested on a schedule (e.g. every 24h for watched repos).
+/// Never updated — only inserted. Prune rows older than 90 days.
+model RepoSnapshot {
+  id         String   @id @default(cuid())
+  fullName   String
+  stars      Int
+  forks      Int
+  openIssues Int
+  pushedAt   DateTime
+  releasedAt DateTime?
+  releaseTag String?
+  snappedAt  DateTime @default(now())
+
+  @@index([fullName, snappedAt])
+  @@index([snappedAt])
+}
+
+/// Scored health snapshot written after a full enrichment run.
+/// Kept for 180 days to power stars-velocity and decay trend detection.
+model RepoHealthScore {
+  id                  String   @id @default(cuid())
+  fullName            String
+  score               Int
+  decay               String
+  readmeQuality       Float
+  starsVelocity       Float
+  dependencyFreshness Float
+  maintenanceQuality  Float
+  ownerQuality        Float
+  scoredAt            DateTime @default(now())
+
+  @@index([fullName, scoredAt])
+  @@index([scoredAt])
+}
+
+/// Owner metadata enriched on first sight and refreshed weekly.
+model OwnerProfile {
+  id          String   @id @default(cuid())
+  login       String   @unique
+  kind        String
+  tier        String
+  followers   Int      @default(0)
+  publicRepos Int      @default(0)
+  company     String?
+  bio         String?
+  knownElite  Boolean  @default(false)
+  refreshedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@index([tier])
+  @@index([refreshedAt])
+}
+
+/// Dependency edge from a repo to an upstream package or repo.
+/// healthSignal mirrors DependencyHealth: Clean | Minor risk | Supply chain risk
+model DependencyMap {
+  id           String   @id @default(cuid())
+  fullName     String
+  depName      String
+  depKind      String
+  healthSignal String
+  detectedAt   DateTime @default(now())
+
+  @@unique([fullName, depName])
+  @@index([fullName])
+  @@index([healthSignal])
+}
+
+/// A repo, owner, or topic the user has asked to monitor.
+model WatchTarget {
+  id        String   @id @default(cuid())
+  kind      String
+  ref       String
+  label     String?
+  addedAt   DateTime @default(now())
+
+  subscriptions WatchSubscription[]
+  events        NotificationEvent[]
+
+  @@unique([kind, ref])
+  @@index([kind])
+}
+
+/// Links a subscriber (local user ID or session) to a WatchTarget.
+model WatchSubscription {
+  id           String      @id @default(cuid())
+  subscriberId String
+  watchId      String
+  watch        WatchTarget @relation(fields: [watchId], references: [id], onDelete: Cascade)
+  active       Boolean     @default(true)
+  createdAt    DateTime    @default(now())
+
+  @@unique([subscriberId, watchId])
+  @@index([subscriberId])
+  @@index([watchId])
+}
+
+/// A triggered alert for a watch target (new repo, decay change, score drop, rising).
+/// Pruned 30 days after seen = true.
+model NotificationEvent {
+  id       String      @id @default(cuid())
+  watchId  String
+  watch    WatchTarget @relation(fields: [watchId], references: [id], onDelete: Cascade)
+  fullName String
+  reason   String
+  detail   String?
+  seen     Boolean     @default(false)
+  firedAt  DateTime    @default(now())
+
+  @@index([watchId, firedAt])
+  @@index([seen, firedAt])
+}
+
+/// Every CLI search stored for rerun and classifier tuning.
+/// Retains last 500 rows per query; older rows can be pruned.
+model SearchHistory {
+  id              String   @id @default(cuid())
+  query           String
+  mode            String
+  domainSpeed     String
+  artifactType    String
+  topResult       String?
+  confidence      String?
+  stageCountsJson Json
+  filtersJson     Json
+  searchedAt      DateTime @default(now())
+
+  @@index([searchedAt])
+  @@index([query])
+}
+
+/// Stage-2-cleared candidate pool captured at a point in time.
+/// Two snapshots of the same topic can be diffed to detect rising/fading repos.
+model TrendSnapshot {
+  id        String   @id @default(cuid())
+  topic     String
+  reposJson Json
+  poolSize  Int
+  snappedAt DateTime @default(now())
+
+  @@index([topic, snappedAt])
+  @@index([snappedAt])
+}
