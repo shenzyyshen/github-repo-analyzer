@@ -29,6 +29,93 @@ type IntentConcept = {
   boostTerms: string[];
 };
 
+export type SessionPreferences = {
+  skipped: Set<string>;  // question keys the user has dismissed with 'any' / 'skip'
+  minStars: number;      // accumulated stars floor from user answers
+};
+
+export function createSessionPreferences(): SessionPreferences {
+  return { skipped: new Set(), minStars: 500 };
+}
+
+export type ClarifyingQuestion = {
+  key: string;
+  text: string;
+};
+
+export function generateClarifyingQuestions(
+  intent: ParsedIntent,
+  userInput: string,
+  prefs: SessionPreferences
+): ClarifyingQuestion[] {
+  const raw = userInput.toLowerCase();
+  const skip = prefs.skipped;
+  const questions: ClarifyingQuestion[] = [];
+
+  // --- Detect semantic domain from the prompt ---
+  const isVision     = /\b(image|photo|classif|detect|vision|fashion|clothing|garment|visual|tagging|tag)\b/.test(raw);
+  const isResale     = /\b(resale|price|prici|vintage|vinted|depop|ebay|second.?hand|market|listing|sell|sold)\b/.test(raw);
+  const isNlp        = /\b(caption|description|text|generat|nlp|language model|llm|title|copy)\b/.test(raw);
+  const isDataset    = /\b(dataset|data|embeddings?|vector|corpus|labeled|annotation)\b/.test(raw);
+  const isMl         = isVision || isNlp || /\b(ml|ai|model|train|predict|neural|deep.?learn)\b/.test(raw);
+  const isSelfHosted = /\b(self.?host|docker|deploy|server|self.?managed)\b/.test(raw);
+  const hasToolType  = /\b(library|lib|framework|cli|service|api|plugin|sdk|app|pipeline|tool)\b/.test(raw);
+
+  // --- Domain-specific questions (highest value, asked first) ---
+
+  if (isVision && isResale && !skip.has("resale-input")) {
+    questions.push({ key: "resale-input", text: "Should it work from photo input, text/metadata, or both?" });
+  }
+
+  if (isResale && !skip.has("resale-platform")) {
+    questions.push({ key: "resale-platform", text: "Which platform are you targeting — Vinted, Depop, eBay, Instagram, or all of them?" });
+  }
+
+  if (isVision && !skip.has("vision-mode")) {
+    questions.push({ key: "vision-mode", text: "Pre-trained model you can fine-tune, or a full training pipeline from scratch?" });
+  }
+
+  if (isNlp && !skip.has("output-type")) {
+    questions.push({ key: "output-type", text: "What output do you need — product title, full description, hashtags, or all?" });
+  }
+
+  if (isDataset && !skip.has("data-format")) {
+    questions.push({ key: "data-format", text: "Do you need a labeled dataset to train on, a pre-trained model to use, or both?" });
+  }
+
+  if (isSelfHosted && !skip.has("deploy-target")) {
+    questions.push({ key: "deploy-target", text: "Where are you deploying — local machine, VPS, cloud (AWS/GCP/Azure), or doesn't matter?" });
+  }
+
+  // --- General questions (fill up to 6 if domain questions didn't get there) ---
+
+  if (!hasToolType && !skip.has("tool-type") && questions.length < 5) {
+    questions.push({ key: "tool-type", text: "What type are you looking for — library, CLI, deployable service, or full framework?" });
+  }
+
+  if (!intent.since && !skip.has("freshness") && questions.length < 5) {
+    questions.push({ key: "freshness", text: "How recently updated? (within 6 months, 1 year — or any)" });
+  }
+
+  if (intent.maturitySignals.length === 0 && !skip.has("maturity") && questions.length < 6) {
+    questions.push({ key: "maturity", text: "Production-ready with 500+ stars, or is a smaller/newer project fine?" });
+  }
+
+  if (!intent.license && !skip.has("license") && questions.length < 6) {
+    questions.push({ key: "license", text: "License preference — MIT, Apache, any open source, or doesn't matter?" });
+  }
+
+  // Ensure minimum 2 questions even for very specific prompts
+  if (questions.length < 2 && !skip.has("maturity")) {
+    questions.push({ key: "maturity", text: "Production-ready with 500+ stars, or is a smaller/newer project fine?" });
+  }
+  if (questions.length < 2 && !skip.has("freshness")) {
+    questions.push({ key: "freshness", text: "How recently updated? (within 6 months, 1 year — or any)" });
+  }
+
+  return questions.slice(0, 6);
+}
+
 export function shouldClarifyBeforeSearch(intent: ParsedIntent): boolean {
   const structureCount =
     (intent.language ? 1 : 0) +
@@ -244,6 +331,24 @@ const INTENT_CONCEPTS: IntentConcept[] = [
     patterns: [/\bdeveloper tooling\b/, /\bdevtool\b/, /\bcli\b/, /\bterminal\b/],
     boostTerms: ["cli", "terminal", "developer-tooling"],
   },
+  {
+    name: "obsidian-plugin",
+    display: "Obsidian plugin / integration",
+    patterns: [/\bobsidian\b/],
+    boostTerms: ["obsidian", "obsidian-plugin", "obsidian-md"],
+  },
+  {
+    name: "vscode-extension",
+    display: "VS Code extension",
+    patterns: [/\bvscode\b/, /\bvs code\b/, /\bvisual studio code\b/],
+    boostTerms: ["vscode", "vscode-extension"],
+  },
+  {
+    name: "notion-integration",
+    display: "Notion integration",
+    patterns: [/\bnotion\b/],
+    boostTerms: ["notion", "notion-api"],
+  },
 ];
 
 export function detectLanguage(input: string): string | null {
@@ -303,11 +408,14 @@ export function parseIntent(userInput: string): ParsedIntent {
   }
 
   const language = detectLanguage(raw);
-  const since = /\b(actively maintained|active maintenance|updated recently|recently updated|actively developed)\b/.test(
-    raw
-  )
-    ? isoDateDaysAgo(90)
-    : null;
+  let since: string | null = null;
+  if (/\b(6[\s-]?months?|last\s+6\s+months?|past\s+6\s+months?|within\s+6\s+months?)\b/.test(raw)) {
+    since = isoDateDaysAgo(180);
+  } else if (/\b(1[\s-]?year|last[\s-]?year|past[\s-]?year|within\s+(a\s+)?year|12[\s-]?months?)\b/.test(raw)) {
+    since = isoDateDaysAgo(365);
+  } else if (/\b(actively maintained|active maintenance|updated recently|recently updated|actively developed)\b/.test(raw)) {
+    since = isoDateDaysAgo(90);
+  }
 
   let license: string | null = null;
   if (/\bmit only\b|\bmit licensed\b|\bmit license\b/.test(raw)) {
@@ -385,7 +493,9 @@ export function inferFilters(
 
   if (!next.since && intent.since) {
     next.since = intent.since;
-    applied.push("Activity: updated in the last 90 days");
+    const daysAgo = Math.round((Date.now() - new Date(intent.since).getTime()) / (24 * 60 * 60 * 1000));
+    const label = daysAgo >= 300 ? "1 year" : daysAgo >= 150 ? "6 months" : "90 days";
+    applied.push(`Activity: updated in the last ${label}`);
   } else if (next.since) {
     applied.push(`Activity: pushed after ${next.since}`);
   }
@@ -453,6 +563,12 @@ function conceptBroadTerms(concept: string): string[] {
       return ["monitoring", "uptime", "status", "page"];
     case "developer-tooling":
       return ["cli", "terminal", "developer-tooling"];
+    case "obsidian-plugin":
+      return ["obsidian", "obsidian-plugin", "obsidian-md"];
+    case "vscode-extension":
+      return ["vscode", "vscode-extension", "visual-studio-code"];
+    case "notion-integration":
+      return ["notion", "notion-api"];
     default:
       return [];
   }

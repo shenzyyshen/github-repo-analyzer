@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { execSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import chalk from "chalk";
 import OpenAI from "openai";
 import { PrismaClient } from "@prisma/client";
 import { GithubAdapter } from "../adapters/github/GithubAdapter.js";
@@ -15,11 +17,14 @@ import {
   buildRetrievalQueries,
   buildBroaderSearchQuery,
   buildClarificationPrompt,
+  createSessionPreferences,
   inferFilters,
   normalizeSearchQuery,
+  type ClarifyingQuestion,
   type ParsedIntent,
   renderAppliedFilters,
   shouldClarifyBeforeSearch,
+  type SessionPreferences,
 } from "./intent.js";
 
 type Role = "user" | "assistant";
@@ -109,6 +114,7 @@ type SelectionChoice =
   | { kind: "pick"; index: number }
   | { kind: "none" }
   | { kind: "rerun" }
+  | { kind: "new" }
   | { kind: "seen" }
   | { kind: "history" }
   | { kind: "back" }
@@ -119,7 +125,7 @@ type TextChoice =
   | { kind: "back" }
   | { kind: "exit" };
 
-const INVALID_SELECTION_MESSAGE = "Enter a number between 1-5, or type 'none', 're run', 'seen', 'history', or 'quit'.";
+const INVALID_SELECTION_MESSAGE = "Enter a number, or type 're run', 'new', 'none', 'seen', 'history', or 'quit'.";
 const SESSION_FILE = ".codex/session.json";
 
 function requireEnv(name: string): string {
@@ -131,7 +137,20 @@ function requireEnv(name: string): string {
 }
 
 function buildGitHubQuery(search: NonNullable<SearchPlan["search"]>): string {
-  const parts: string[] = [search.query];
+  // Qualifiers like `stars:>500 pushed:>2025-04-12 language:X` can take ~60 chars.
+  // GitHub enforces a 256-char limit on the full query string.
+  const MAX_QUERY_TERMS = 180;
+  const trimmedQuery = search.query.length > MAX_QUERY_TERMS
+    ? search.query
+        .split(" ")
+        .reduce((acc: string[], term) => {
+          if ((acc.join(" ") + " " + term).length <= MAX_QUERY_TERMS) acc.push(term);
+          return acc;
+        }, [])
+        .join(" ")
+    : search.query;
+
+  const parts: string[] = [trimmedQuery];
   if (search.language) parts.push(`language:${search.language}`);
   if (search.minStars > 0) parts.push(`stars:>${search.minStars}`);
   if (search.since) parts.push(`pushed:>${search.since}`);
@@ -330,14 +349,19 @@ function preselectCandidates(
   results: SearchResult[],
   intent: ParsedIntent,
   top: number,
-  random: boolean
+  random: boolean,
+  minStars = 200
 ): SearchResult[] {
   if (random) {
     return pickResults(results, top, true);
   }
 
-  const candidatePoolSize = Math.min(Math.max(top * 4, 15), 25, results.length);
-  const scored = results
+  // Hard floor: never surface repos below the stars threshold
+  const eligible = results.filter((repo) => repo.stars >= minStars);
+  const pool = eligible.length >= top ? eligible : results;
+
+  const candidatePoolSize = Math.min(Math.max(top * 4, 15), 25, pool.length);
+  const scored = pool
     .map((repo) => {
       const tokens = tokenizeSearchResult(repo);
       const intentTerms = [
@@ -350,15 +374,21 @@ function preselectCandidates(
       const languageBonus =
         intent.language && repo.language && repo.language.toLowerCase() === intent.language.toLowerCase() ? 2 : 0;
       const starsBonus =
-        repo.stars >= 10_000
-          ? 4
-          : repo.stars >= 1_000
-            ? 3
-            : repo.stars >= 100
-              ? 2
-              : repo.stars >= 25
-                ? 1
-                : 0;
+        repo.stars >= 50_000
+          ? 8
+          : repo.stars >= 10_000
+            ? 6
+            : repo.stars >= 5_000
+              ? 5
+              : repo.stars >= 1_000
+                ? 4
+                : repo.stars >= 500
+                  ? 3
+                  : repo.stars >= 200
+                    ? 2
+                    : repo.stars >= 100
+                      ? 1
+                      : 0;
       const forksBonus =
         repo.forks >= 1_000
           ? 3
@@ -771,7 +801,7 @@ function buildRiskSummary(item: AnalyzedRepo): string | null {
     Number([...rootNames].some((name) => name.startsWith(".github")));
 
   if (item.error) {
-    return `analysis failed: ${item.error}`;
+    return "DB offline — metrics shown from search data only";
   }
   if (issuePressure > 0.35 && contributors < 5) {
     return "issue pressure looks high relative to repo size and maintainer depth";
@@ -939,30 +969,41 @@ async function writeScoutReport(results: RankedShortlistItem[], summary: string)
 }
 
 function renderShortlist(results: RankedShortlistItem[]): string {
-  return results
-    .map((ranked, index) => {
-      const { item } = ranked;
-      const caution = buildRiskSummary(item) ?? "none / working clean";
-      const stars = item.search.stars.toLocaleString();
-      const forks = item.search.forks.toLocaleString();
-      const contributors = getContributorCount(item).toLocaleString();
-      const age = getRepoAgeLabel(item);
-      const lastCommit = getLastCommit(item).toISOString().slice(0, 10);
-      const language = getPrimaryLanguage(item);
-      const lines = [
-        `${index + 1}. ${item.search.fullName}`,
-        `   Best for: ${ranked.bestFor}`,
-        `   Why: ${ranked.why}`,
-        ranked.tradeoff ? `   Tradeoff: ${ranked.tradeoff}` : null,
-        `   Caution: ${caution}`,
-        `   Stars: ${stars} | Forks: ${forks} | Contributors: ${contributors}`,
-        `   Age: ${age} | Last push: ${lastCommit} | Language: ${language}`,
-        `   ${buildRepoUrl(item.search.fullName)}`,
-      ].filter(Boolean);
+  const HR = chalk.dim("  " + "─".repeat(60));
+  const lbl = (s: string) => chalk.dim(s.padEnd(11));
+  const DOT = chalk.dim("  ·  ");
 
-      return lines.join("\n");
-    })
-    .join("\n\n");
+  const blocks = results.map((ranked, index) => {
+    const { item } = ranked;
+    const caution = buildRiskSummary(item);
+    const stars = item.search.stars.toLocaleString();
+    const forks = item.search.forks.toLocaleString();
+    const contributors = getContributorCount(item).toLocaleString();
+    const lastCommitDate = getLastCommit(item);
+    const lastCommit = lastCommitDate.toISOString().slice(0, 10);
+    const isStale = Date.now() - lastCommitDate.getTime() > 6 * 30 * 24 * 60 * 60 * 1000;
+    const lastCommitColored = isStale ? chalk.red(lastCommit) : chalk.green(lastCommit);
+    const language = getPrimaryLanguage(item);
+    const pad = "       ";
+
+    const rows: (string | null)[] = [
+      `  ${chalk.cyan.bold(`${index + 1}.`)}  ${chalk.bold.white(item.search.fullName)}${language ? chalk.dim(`  [${language}]`) : ""}`,
+      item.search.description ? `${pad}${chalk.dim(item.search.description)}` : null,
+      "",
+      `${pad}${lbl("Best for")} ${ranked.bestFor}`,
+      `${pad}${lbl("Why")} ${ranked.why}`,
+      ranked.tradeoff ? `${pad}${lbl("Tradeoff")} ${ranked.tradeoff}` : null,
+      caution ? `${pad}${lbl("Caution")} ${chalk.yellow(`⚠  ${caution}`)}` : null,
+      "",
+      `${pad}${chalk.yellow("★")} ${chalk.yellow(stars)} stars${DOT}${forks} forks${DOT}${contributors} contributors`,
+      `${pad}Last updated ${lastCommitColored}${DOT}Language ${language ?? "—"}`,
+      `${pad}${chalk.blue.underline(buildRepoUrl(item.search.fullName))}`,
+    ];
+
+    return rows.filter((r): r is string => r !== null).join("\n");
+  });
+
+  return `\n${HR}\n${blocks.join(`\n\n${HR}\n`)}\n\n${HR}\n`;
 }
 
 async function promptForSelection(
@@ -972,7 +1013,7 @@ async function promptForSelection(
   while (true) {
     const selection = (
       await rl.question(
-        "Which repo would you like to analyze in depth? Enter a number, or type 'none' to refine the search.\n> "
+        `${chalk.dim("Pick a number to dive deeper —")} ${chalk.cyan("re run")} ${chalk.dim("to search again with feedback,")} ${chalk.cyan("new")} ${chalk.dim("for a fresh prompt,")} ${chalk.cyan("none")} ${chalk.dim("to refine.")}\n> `
       )
     )
       .trim()
@@ -993,6 +1034,10 @@ async function promptForSelection(
 
     if (selection === "re run" || selection === "rerun") {
       return { kind: "rerun" };
+    }
+
+    if (selection === "new") {
+      return { kind: "new" };
     }
 
     if (selection === "seen") {
@@ -1357,6 +1402,7 @@ class AiBrain {
       "- Use null for unknown optional fields.",
       "- reply should be short and conversational.",
       "- followUp should be a single useful next question when applicable.",
+      "- Default minStars to 500. Only go lower if the user explicitly accepts fewer stars.",
       "",
       "Conversation history:",
       historyText || "(none)",
@@ -1375,7 +1421,7 @@ class AiBrain {
         search: {
           query: normalizeSearchQuery(userInput) || userInput,
           language: null,
-          minStars: 0,
+          minStars: 500,
           since: null,
           license: null,
           sort: "stars",
@@ -1424,6 +1470,39 @@ class AiBrain {
           ? ` Some repo analyses failed, so this shortlist is based partly on search results.`
           : "";
       return `I found a shortlist worth checking: ${names}.${failureNote} Do you want me to narrow further by framework, stars, or maintenance activity?`;
+    }
+  }
+
+  async generateClarifyingQuestions(
+    userInput: string,
+    prefs: SessionPreferences
+  ): Promise<ClarifyingQuestion[]> {
+    const skipped = [...prefs.skipped].join(", ") || "none";
+    const prompt = [
+      "You are helping a developer find GitHub repositories.",
+      "Given the user's search query, generate 2-4 short, specific clarifying questions that will meaningfully sharpen the GitHub search.",
+      "Rules:",
+      "- Questions must be directly relevant to this specific query — no generic filler.",
+      "- Do NOT ask about things already answered in the query.",
+      `- Do NOT ask about these topics (already dismissed): ${skipped}.`,
+      "- Assign each question a short snake_case key from this list when it fits: freshness, maturity, tool-type, language, deploy-target, license, scale, integration, output-type. Otherwise invent a descriptive key.",
+      "- Return JSON only: an array of {key: string, text: string} objects.",
+      "- text should be phrased as a short direct question, no more than 15 words.",
+      "",
+      `User query: "${userInput}"`,
+    ].join("\n");
+
+    try {
+      const raw = await this.generateText(prompt);
+      const start = raw.indexOf("[");
+      const end = raw.lastIndexOf("]");
+      if (start === -1 || end === -1) throw new Error("No JSON array found");
+      const parsed = JSON.parse(raw.slice(start, end + 1)) as Array<{ key: string; text: string }>;
+      return parsed
+        .filter((q) => q.key && q.text && !prefs.skipped.has(q.key))
+        .slice(0, 4);
+    } catch {
+      return [];
     }
   }
 
@@ -1551,10 +1630,22 @@ async function main() {
   const rejectedRepos = new Set<string>();
   const seenRepos: SeenRepoEntry[] = [...persistedSession.seenRepos];
   const shortlistHistory: ShortlistHistoryEntry[] = [...persistedSession.shortlistHistory];
+  const sessionPrefs: SessionPreferences = createSessionPreferences();
   let pendingInput: string | null = null;
 
+  let dbAvailable = true;
+  try {
+    await prisma.$connect();
+  } catch {
+    dbAvailable = false;
+  }
+
   output.write("\x1bc");
-  output.write("GitHub Repo Scout — what are you looking for?\n");
+  output.write(chalk.bold("GitHub Repo Scout") + " — what are you looking for?\n");
+  if (!dbAvailable) {
+    output.write(chalk.yellow("⚠  Database offline — running without metrics cache. Results shown from GitHub search only.\n"));
+  }
+  output.write("\n");
 
   try {
     outer: while (true) {
@@ -1587,6 +1678,51 @@ async function main() {
       const effectiveSearch = inferred.search;
       const { intent } = inferred;
 
+      // Ask clarifying questions — LLM generates questions specific to this query
+      const questions = await brain.generateClarifyingQuestions(userInput, sessionPrefs);
+      if (questions.length > 0) {
+        output.write(chalk.cyan.bold("\nA few questions to sharpen the search:\n\n"));
+        for (let qi = 0; qi < questions.length; qi++) {
+          const { key, text } = questions[qi];
+          const answer = (await rl.question(`${chalk.dim(`${qi + 1}.`)} ${text}\n> `)).trim().toLowerCase();
+
+          const isDismissed = !answer || /^(any|skip|no|nope|doesn.?t matter|don.?t care|idc|n\/a)$/.test(answer);
+          if (isDismissed) {
+            sessionPrefs.skipped.add(key);
+            continue;
+          }
+
+          // Freshness
+          if (!effectiveSearch.since) {
+            if (/6.?month/.test(answer)) {
+              effectiveSearch.since = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+            } else if (/1.?year|12.?month/.test(answer)) {
+              effectiveSearch.since = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+            }
+          }
+
+          // Stars floor from maturity answer
+          if (/production|widely|established|mature|popular/.test(answer)) {
+            sessionPrefs.minStars = Math.max(sessionPrefs.minStars, 1_000);
+            effectiveSearch.minStars = Math.max(effectiveSearch.minStars, sessionPrefs.minStars);
+          } else if (/1000|1k|thousand/.test(answer)) {
+            sessionPrefs.minStars = Math.max(sessionPrefs.minStars, 1_000);
+            effectiveSearch.minStars = Math.max(effectiveSearch.minStars, sessionPrefs.minStars);
+          } else if (/5000|5k/.test(answer)) {
+            sessionPrefs.minStars = Math.max(sessionPrefs.minStars, 5_000);
+            effectiveSearch.minStars = Math.max(effectiveSearch.minStars, sessionPrefs.minStars);
+          }
+
+          // Answers set structured filters only — never appended to the query string
+        }
+        output.write("\n");
+      }
+
+      // Apply accumulated stars floor from session
+      if (effectiveSearch.minStars < sessionPrefs.minStars) {
+        effectiveSearch.minStars = sessionPrefs.minStars;
+      }
+
       if (shouldClarifyBeforeSearch(intent)) {
         const filterText = renderAppliedFilters(inferred.applied);
         if (filterText) {
@@ -1599,49 +1735,98 @@ async function main() {
       }
 
       output.write("Searching GitHub...\n");
-      const query = buildGitHubQuery(effectiveSearch);
       let results = await searchMergedCandidates(githubAdapter, effectiveSearch, intent);
-      if (results.length === 0) {
-        if (intent.confidence < 0.4) {
-          const filterText = renderAppliedFilters(inferred.applied);
-          if (filterText) {
-            output.write(`${filterText}\n`);
-          }
-          const response =
-            "I am not confident I interpreted that request correctly. Try naming the product type, language, or license you care about most.";
-          output.write(`${response}\n`);
-          history.push({ role: "assistant", content: response });
-          continue;
-        }
+      results = results.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
 
-        const broaderQuery = buildBroaderSearchQuery(intent);
-        if (broaderQuery && broaderQuery !== effectiveSearch.query) {
-          output.write(`Retrying with broader query: ${broaderQuery}\n`);
-          results = await searchMergedCandidates(githubAdapter, { ...effectiveSearch, query: broaderQuery }, intent);
-        }
-
-        const relaxedQuery = normalizeSearchQuery(effectiveSearch.query);
-        if (results.length === 0 && relaxedQuery && relaxedQuery !== effectiveSearch.query) {
-          output.write(`Retrying with broader query: ${relaxedQuery}\n`);
-          results = await searchMergedCandidates(githubAdapter, { ...effectiveSearch, query: relaxedQuery }, intent);
-        }
-
-        if (results.length === 0) {
-          const fallbackQuery = broaderQuery ?? relaxedQuery ?? effectiveSearch.query;
-          const relaxedSearch = {
-            ...effectiveSearch,
-            query: fallbackQuery,
-            since: null,
-            license: null,
-            minStars: 0,
-            sort: "stars" as const,
-          };
-          output.write(`Retrying with relaxed filters: ${fallbackQuery}\n`);
-          results = await searchMergedCandidates(githubAdapter, relaxedSearch, intent);
+      // Star floor baked into the GitHub query may have killed all results — retry without it
+      if (results.length === 0 && effectiveSearch.minStars > 0) {
+        const relaxed = await searchMergedCandidates(githubAdapter, { ...effectiveSearch, minStars: 0 }, intent);
+        const relaxedFiltered = relaxed.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
+        if (relaxedFiltered.length > 0) {
+          output.write(chalk.dim(`  → No results with ${effectiveSearch.minStars}+ stars — showing best available.\n\n`));
+          results = relaxedFiltered;
         }
       }
-      results = results.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
-      const candidates = preselectCandidates(results, intent, plan.search.top, plan.search.random);
+
+      let candidates = preselectCandidates(results, intent, plan.search.top, plan.search.random, sessionPrefs.minStars);
+
+      // Nothing passed the stars floor — ask the user what to sacrifice
+      if (candidates.length === 0 && results.length > 0) {
+        const bestAvailable = [...results].sort((a, b) => b.stars - a.stars)[0];
+        const bestStars = bestAvailable?.stars ?? 0;
+
+        output.write("\n");
+        output.write(chalk.yellow(`  No repos found with ${sessionPrefs.minStars}+ stars for this search.\n`));
+        output.write(chalk.dim(`  Best available has ${bestStars.toLocaleString()} stars.\n\n`));
+        output.write(chalk.bold("  What would you like to do?\n\n"));
+        output.write(`  ${chalk.cyan("1.")} Lower the stars floor to ${Math.max(50, Math.floor(sessionPrefs.minStars / 2))}+\n`);
+        output.write(`  ${chalk.cyan("2.")} Accept what's available (${bestStars}+ stars)\n`);
+        output.write(`  ${chalk.cyan("3.")} Split the problem — find separate repos for different parts\n`);
+        output.write(`  ${chalk.cyan("4.")} Try a different search angle on the same topic\n`);
+        output.write(`  ${chalk.cyan("5.")} Start a new prompt entirely\n\n`);
+
+        const choice = (await rl.question("> ")).trim();
+
+        if (choice === "1") {
+          const newFloor = Math.max(50, Math.floor(sessionPrefs.minStars / 2));
+          sessionPrefs.minStars = newFloor;
+          effectiveSearch.minStars = newFloor;
+          output.write(chalk.dim(`  → Stars floor lowered to ${newFloor}+. Searching again...\n\n`));
+          candidates = preselectCandidates(results, intent, plan.search.top, plan.search.random, newFloor);
+
+        } else if (choice === "2") {
+          sessionPrefs.minStars = 0;
+          effectiveSearch.minStars = 0;
+          output.write(chalk.dim("  → Accepting all results. Searching again...\n\n"));
+          candidates = preselectCandidates(results, intent, plan.search.top, plan.search.random, 0);
+
+        } else if (choice === "3") {
+          output.write(chalk.cyan.bold("\n  Split search — describe the first part you want to find:\n"));
+          output.write(chalk.dim("  (e.g. 'image classifier for clothing' then separately 'price estimator for vintage items')\n\n"));
+          const splitPrompt = (await rl.question("> ")).trim();
+          if (splitPrompt) {
+            pendingInput = splitPrompt;
+            continue outer;
+          }
+
+        } else if (choice === "4") {
+          output.write(chalk.cyan.bold("\n  Different angle — describe what you're really trying to solve:\n\n"));
+          const newAngle = (await rl.question("> ")).trim();
+          if (newAngle) {
+            pendingInput = newAngle;
+            continue outer;
+          }
+
+        } else if (choice === "5") {
+          output.write(chalk.cyan.bold("\nStarting fresh — what are you looking for?\n\n"));
+          history.length = 0;
+          rejectedRepos.clear();
+          sessionPrefs.skipped.clear();
+          sessionPrefs.minStars = 200;
+          pendingInput = null;
+          continue outer;
+
+        } else {
+          // Unrecognised input — treat as a new prompt
+          if (choice) {
+            pendingInput = choice;
+            continue outer;
+          }
+        }
+      }
+
+      // Still nothing after any adjustments — try a broader query silently before giving up
+      if (candidates.length === 0) {
+        const broaderQuery = buildBroaderSearchQuery(intent);
+        if (broaderQuery && broaderQuery !== effectiveSearch.query) {
+          const broaderResults = await searchMergedCandidates(githubAdapter, { ...effectiveSearch, query: broaderQuery }, intent);
+          const broaderFiltered = broaderResults.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
+          candidates = preselectCandidates(broaderFiltered, intent, plan.search.top, plan.search.random, sessionPrefs.minStars);
+          if (candidates.length > 0) {
+            output.write(chalk.dim(`  → Broadened search to: ${broaderQuery}\n\n`));
+          }
+        }
+      }
       const hadCandidates = candidates.length > 0;
 
       output.write("Analyzing results...\n");
@@ -1652,7 +1837,7 @@ async function main() {
             ? "I still do not have a confident read on that request. Try specifying the repo category, stack, or deployment style."
             : hadCandidates
               ? "I did not find perfect matches, but I found a few plausible repos worth checking."
-            : "I did not find strong matches for that query. Try narrowing by framework, language, stars, or maintenance level."
+            : "GitHub returned no results for that search. Try a broader term — e.g. drop 'claude' and search by the core topic instead."
           : await brain.respond(history, userInput, effectiveSearch, analyzed);
       const filterText = renderAppliedFilters(inferred.applied);
       if (filterText) {
@@ -1727,17 +1912,80 @@ async function main() {
           }
         }
 
+        if (selection.kind === "new") {
+          output.write(chalk.cyan.bold("\nStarting fresh — what are you looking for?\n\n"));
+          history.length = 0;
+          rejectedRepos.clear();
+          sessionPrefs.skipped.clear();
+          sessionPrefs.minStars = 50;
+          pendingInput = null;
+          continue outer;
+        }
+
         if (selection.kind === "rerun") {
           shortlist.forEach((ranked) => rejectedRepos.add(ranked.item.search.fullName));
           history.push({
             role: "assistant",
             content: `Previous Shortlist (set aside for now): ${buildShortlistNames(shortlist)}`,
           });
-          pendingInput = userInput;
+
+          // Collect feedback before re-running
+          output.write(chalk.cyan.bold("\nWhat was missing in those results?\n"));
+          output.write(chalk.dim("(e.g. more stars, more recent, different framework, broader angle — or just press Enter to retry as-is)\n\n"));
+          const feedback = (await rl.question("> ")).trim().toLowerCase();
+
+          let refinedPrompt = userInput;
+
+          if (feedback) {
+            // Stars adjustment
+            if (/more stars?|higher stars?|popular|well.?known|widely.?used/.test(feedback)) {
+              sessionPrefs.minStars = Math.max(sessionPrefs.minStars, 500);
+              output.write(chalk.dim(`  → Raising stars floor to ${sessionPrefs.minStars}+\n`));
+            }
+            if (/1000|1k|thousand/.test(feedback)) {
+              sessionPrefs.minStars = Math.max(sessionPrefs.minStars, 1000);
+              output.write(chalk.dim(`  → Raising stars floor to ${sessionPrefs.minStars}+\n`));
+            }
+
+            // Freshness
+            if (/more recent|recently updated|active|maintained/.test(feedback)) {
+              output.write(chalk.dim("  → Filtering to repos updated in the last 6 months\n"));
+            }
+
+            // Append feedback terms to refine the prompt
+            const feedbackTerms = normalizeSearchQuery(feedback);
+            if (feedbackTerms) {
+              refinedPrompt = `${userInput} ${feedbackTerms}`.trim();
+            }
+          }
+
+          pendingInput = refinedPrompt;
           continue outer;
         }
 
         const chosen = shortlist[selection.index].item.search;
+        const repoUrl = `https://github.com/${chosen.fullName}`;
+        output.write(`\n${chalk.cyan.bold(chosen.fullName)}\n${chalk.blue.underline(repoUrl)}\n\n`);
+        output.write(`${chalk.dim("a")} ${chalk.bold("analyze")}  — deep analysis + report\n`);
+        output.write(`${chalk.dim("c")} ${chalk.bold("clone")}    — git clone into current directory\n`);
+        output.write(`${chalk.dim("b")} ${chalk.bold("back")}     — return to shortlist\n\n`);
+        const postChoice = (await rl.question("> ")).trim().toLowerCase();
+
+        if (postChoice === "c" || postChoice === "clone") {
+          output.write(chalk.dim(`\nCloning ${chosen.fullName}...\n`));
+          try {
+            execSync(`git clone https://github.com/${chosen.fullName}.git`, { stdio: "inherit" });
+            output.write(chalk.green(`\nCloned into ./${chosen.fullName.split("/")[1]}\n\n`));
+          } catch {
+            output.write(chalk.red("Clone failed. Make sure git is installed and you have network access.\n\n"));
+          }
+          continue shortlist;
+        }
+
+        if (postChoice === "b" || postChoice === "back") {
+          continue shortlist;
+        }
+
         output.write(`Running in-depth analysis for ${chosen.fullName}...\n`);
         const repoContext = await buildRepoContext(githubAdapter, analyzeRepo, chosen);
         await writeAnalysisReport(repoContext);
