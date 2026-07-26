@@ -1,7 +1,10 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
 import type { Metrics } from "../../domain/entities/Metrics.js";
 import type { TrendingRepo } from "../../domain/entities/TrendingRepo.js";
+import type { RepoSnapshot } from "../../domain/entities/RepoSnapshot.js";
+import type { RepoHealthScoreRecord } from "../../domain/entities/RepoHealthScoreRecord.js";
 import type { MetricsRepoPort } from "../../ports/MetricsRepoPort.js";
+import type { RepoIntelligencePort } from "../../ports/RepoIntelligencePort.js";
 
 function toLanguages(value: Prisma.JsonValue | null): Record<string, number> {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -34,7 +37,7 @@ function parseStarGrowth(value: string): number {
   return Number.isNaN(num) ? 0 : num;
 }
 
-export class PrismaAdapter implements MetricsRepoPort {
+export class PrismaAdapter implements MetricsRepoPort, RepoIntelligencePort {
   constructor(private readonly prisma: PrismaClient) {}
 
   async saveMetrics(data: Metrics): Promise<void> {
@@ -122,5 +125,34 @@ export class PrismaAdapter implements MetricsRepoPort {
     return filtered.sort(
       (a, b) => parseStarGrowth(b.starGrowth24h) - parseStarGrowth(a.starGrowth24h)
     );
+  }
+
+  async saveSnapshot(data: RepoSnapshot): Promise<void> {
+    await this.prisma.repoSnapshot.create({
+      data: {
+        fullName: data.fullName,
+        stars: data.stars,
+        forks: data.forks,
+        openIssues: data.openIssues,
+        pushedAt: data.pushedAt,
+        releasedAt: data.releasedAt,
+        releaseTag: data.releaseTag,
+      },
+    });
+  }
+
+  async saveHealthScore(data: RepoHealthScoreRecord): Promise<void> {
+    await this.prisma.repoHealthScore.create({
+      data: {
+        fullName: data.fullName,
+        score: data.score,
+        decay: data.decay,
+        readmeQuality: data.readmeQuality,
+        starsVelocity: data.starsVelocity,
+        dependencyFreshness: data.dependencyFreshness,
+        maintenanceQuality: data.maintenanceQuality,
+        ownerQuality: data.ownerQuality,
+      },
+    });
   }
 }

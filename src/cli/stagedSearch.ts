@@ -3,6 +3,7 @@ import type { Metrics } from "../domain/entities/Metrics.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
 import type { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { RepoApiPort, RepoReleaseInfo, RepoRootEntry } from "../ports/RepoApiPort.js";
+import type { RepoIntelligencePort } from "../ports/RepoIntelligencePort.js";
 import {
   buildRetrievalQueries,
   inferFilters,
@@ -593,9 +594,43 @@ const EMPTY_INTENT: ParsedIntent = {
   confidence: 0,
 };
 
+async function persistIntelligence(
+  repoIntelligencePort: RepoIntelligencePort,
+  result: RankedRepo
+): Promise<void> {
+  try {
+    await Promise.all([
+      repoIntelligencePort.saveSnapshot({
+        fullName: result.repo.fullName,
+        stars: result.repo.stars,
+        forks: result.repo.forks,
+        openIssues: result.metrics?.openIssues ?? 0,
+        pushedAt: result.repo.pushedAt,
+        releasedAt: result.latestRelease?.publishedAt ?? null,
+        releaseTag: result.latestRelease?.tagName ?? null,
+      }),
+      repoIntelligencePort.saveHealthScore({
+        fullName: result.repo.fullName,
+        score: result.healthScore,
+        decay: result.decay,
+        readmeQuality: result.breakdown.health.readmeQuality,
+        starsVelocity: result.breakdown.health.starsVelocity,
+        dependencyFreshness: result.breakdown.health.dependencyFreshness,
+        maintenanceQuality: result.breakdown.health.maintenanceQuality,
+        ownerQuality: result.breakdown.health.ownerQuality,
+      }),
+    ]);
+  } catch (err) {
+    // Snapshot/health persistence is telemetry for future decay/trend detection —
+    // a write failure must never break the search results the user is waiting on.
+    console.error(`Failed to persist intelligence data for ${result.repo.fullName}:`, err);
+  }
+}
+
 export async function runStagedSearch(
   repoApiPort: RepoApiPort,
   analyzeRepo: AnalyzeRepo,
+  repoIntelligencePort: RepoIntelligencePort,
   originalQuery: string,
   baseSearch: SearchInput,
   options: StagedSearchOptions
@@ -705,6 +740,8 @@ export async function runStagedSearch(
     .filter(Boolean) as RankedRepo[];
 
   ranked.sort((a, b) => b.finalScore - a.finalScore);
+
+  await Promise.all(ranked.map((result) => persistIntelligence(repoIntelligencePort, result)));
 
   const returnedCount = classification.intentMode === "best_match" ? 1 : options.top;
   const results = ranked.slice(0, returnedCount).map((result, index, arr) => {

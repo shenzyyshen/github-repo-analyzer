@@ -1,5 +1,6 @@
 import type { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { RepoApiPort } from "../ports/RepoApiPort.js";
+import type { RepoIntelligencePort } from "../ports/RepoIntelligencePort.js";
 import type { QueryTranslator } from "../ai/QueryTranslator.js";
 import { renderStagedSearch, runStagedSearch, type IntentMode } from "./stagedSearch.js";
 
@@ -19,6 +20,7 @@ export class SearchCommand {
   constructor(
     private readonly repoApiPort: RepoApiPort,
     private readonly analyzeRepo: AnalyzeRepo,
+    private readonly repoIntelligencePort: RepoIntelligencePort,
     private readonly translator: QueryTranslator
   ) {}
 
@@ -38,6 +40,7 @@ export class SearchCommand {
     const result = await runStagedSearch(
       this.repoApiPort,
       this.analyzeRepo,
+      this.repoIntelligencePort,
       query,
       {
         query: q,

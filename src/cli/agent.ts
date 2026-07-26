@@ -1186,7 +1186,7 @@ async function main() {
       // than padding with weak matches. Replaces the old hand-rolled scorer.
       let staged: StagedSearchResult;
       try {
-        staged = await runStagedSearch(githubAdapter, analyzeRepo, userInput, effectiveSearch, {
+        staged = await runStagedSearch(githubAdapter, analyzeRepo, prismaAdapter, userInput, effectiveSearch, {
           top: plan.search.top,
           random: plan.search.random,
         });

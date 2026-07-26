@@ -52,7 +52,7 @@ async function main() {
         requireEnv("OPENAI_API_KEY"),
         process.env.OPENAI_MODEL
       );
-      const command = new SearchCommand(githubAdapter, analyzeRepo, translator);
+      const command = new SearchCommand(githubAdapter, analyzeRepo, prismaAdapter, translator);
 
       try {
         await command.execute(query, {
