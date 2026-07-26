@@ -9,7 +9,7 @@ import {
   inferFilters,
   type ParsedIntent,
   type SearchInput,
-} from "./intent.js";
+} from "../domain/usecases/ParseIntent.js";
 import {
   CONFIDENCE_THRESHOLDS,
   DOMAIN_SPEED_TERMS,

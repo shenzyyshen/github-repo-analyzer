@@ -15,6 +15,10 @@ Bugs and gaps found during work on this codebase, logged rather than fixed inlin
 - **`--trends` flag** — documented as a goal in `action-plan-v2.md` Phase 11, does not exist in `src/cli/index.ts`. `--explain` does exist and works.
 - **Spikes A/B/C** (`action-plan-v2.md`, prerequisites for Phase 1) — README-quality-scoring calibration, dependency-data-source validation, and intent-classification-accuracy testing were never formally run as the structured exercises the plan describes. `reports/SEARCH_CRITERIA_REVIEW_2026-03-30.md` and `reports/SEARCH_AND_NOTIFICATIONS_BRAINSTORM_2026-04-01.md` cover adjacent ground informally but aren't a substitute.
 
+## Dead code
+
+- **`generateClarifyingQuestions` (`src/domain/usecases/ParseIntent.ts`, moved from `src/cli/intent.ts`)** — a rule-based clarifying-question generator, exported but never called anywhere in the codebase. `AiBrain.generateClarifyingQuestions` (`src/cli/agent.ts:953`, LLM-based) is what's actually wired in at the call site (`agent.ts:1127`). Found during the `ParseIntent` extraction, 2026-07-27; ported as-is to keep that extraction a pure move rather than deciding here whether the rule-based version should be deleted or revived as an LLM fallback.
+
 ## Duplication
 
 - **`src/ai/QueryTranslator.ts` and `AiBrain` (`src/cli/agent.ts`)** duplicate LLM plumbing — separate `OpenAI` client construction, separate ad-hoc JSON-extraction from response text. Slated to collapse onto a single `LlmPort`/`OpenAiAdapter` in the hexagon refactor (see `docs/HEXAGON-REFACTOR-PLAN.md`), not fixed standalone.

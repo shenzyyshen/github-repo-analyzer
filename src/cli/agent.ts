@@ -24,7 +24,7 @@ import {
   renderAppliedFilters,
   shouldClarifyBeforeSearch,
   type SessionPreferences,
-} from "./intent.js";
+} from "../domain/usecases/ParseIntent.js";
 import { runStagedSearch, type RankedRepo, type StagedSearchResult } from "./stagedSearch.js";
 
 type Role = "user" | "assistant";
