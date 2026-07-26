@@ -15,7 +15,6 @@ import type { SearchResult } from "../domain/entities/SearchResult.js";
 import type { RepoReleaseInfo, RepoRootEntry } from "../ports/RepoApiPort.js";
 import {
   buildRetrievalQueries,
-  buildBroaderSearchQuery,
   buildClarificationPrompt,
   createSessionPreferences,
   inferFilters,
@@ -26,6 +25,7 @@ import {
   shouldClarifyBeforeSearch,
   type SessionPreferences,
 } from "./intent.js";
+import { runStagedSearch, type RankedRepo, type StagedSearchResult } from "./stagedSearch.js";
 
 type Role = "user" | "assistant";
 
@@ -158,16 +158,6 @@ function buildGitHubQuery(search: NonNullable<SearchPlan["search"]>): string {
   return parts.join(" ");
 }
 
-function pickResults(results: SearchResult[], top: number, random: boolean): SearchResult[] {
-  if (!random) return results.slice(0, top);
-  const copy = [...results];
-  for (let i = copy.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [copy[i], copy[j]] = [copy[j], copy[i]];
-  }
-  return copy.slice(0, top);
-}
-
 function summarizeResults(results: AnalyzedRepo[]): string {
   if (results.length === 0) {
     return "No repositories were found.";
@@ -210,47 +200,6 @@ function getPrimaryLanguage(item: AnalyzedRepo): string {
   return item.search.language ?? "unknown";
 }
 
-function buildRecommendationReason(item: AnalyzedRepo): string {
-  const parts: string[] = [];
-  if (item.search.stars >= 50_000) {
-    parts.push("very widely adopted");
-  } else if (item.search.stars >= 10_000) {
-    parts.push("strong adoption");
-  }
-
-  const ageDays = Math.floor((Date.now() - getLastCommit(item).getTime()) / (24 * 60 * 60 * 1000));
-  if (ageDays <= 7) {
-    parts.push("recently active");
-  } else if (ageDays <= 30) {
-    parts.push("active in the last month");
-  }
-
-  if (!item.error && item.metrics && item.metrics.openIssues < 100) {
-    parts.push("manageable issue load");
-  }
-
-  if (parts.length === 0) {
-    parts.push("relevant match for the query");
-  }
-
-  return parts.join(", ");
-}
-
-function computeScore(item: AnalyzedRepo): number {
-  const starsScore = Math.min(5, Math.log10(Math.max(item.search.stars, 1)));
-  const ageDays = Math.floor((Date.now() - getLastCommit(item).getTime()) / (24 * 60 * 60 * 1000));
-  const recencyScore = ageDays <= 7 ? 3 : ageDays <= 30 ? 2 : ageDays <= 180 ? 1 : 0;
-  const issueScore =
-    item.metrics && !item.error
-      ? item.metrics.openIssues <= 50
-        ? 2
-        : item.metrics.openIssues <= 200
-        ? 1
-        : 0
-      : 0;
-  return Math.max(1, Math.min(10, Math.round(starsScore + recencyScore + issueScore)));
-}
-
 function buildRepoUrl(fullName: string): string {
   return `https://github.com/${fullName}`;
 }
@@ -272,518 +221,6 @@ function getRepoAgeLabel(item: AnalyzedRepo): string {
 
 function getContributorCount(item: AnalyzedRepo): number {
   return item.metrics?.contributors ?? 0;
-}
-
-function tokenizeRepo(item: AnalyzedRepo): Set<string> {
-  return new Set(
-    [
-      item.search.fullName,
-      item.search.name,
-      item.search.description ?? "",
-      getPrimaryLanguage(item),
-      item.readme ?? "",
-      ...item.rootContents.map((entry) => entry.name),
-      ...(item.search.topics ?? []),
-    ]
-      .join(" ")
-      .toLowerCase()
-      .replace(/[^\w\s-]/g, " ")
-      .split(/\s+/)
-      .filter(Boolean)
-  );
-}
-
-type RepoCategory =
-  | "service"
-  | "framework"
-  | "sdk"
-  | "plugin"
-  | "desktop-app"
-  | "cli"
-  | "server"
-  | "workflow"
-  | "library"
-  | "general";
-
-function extractRepoCategory(item: AnalyzedRepo): RepoCategory {
-  const text = [
-    item.search.fullName,
-    item.search.description ?? "",
-    item.readme ?? "",
-    ...item.rootContents.map((entry) => entry.name),
-    ...(item.search.topics ?? []),
-  ]
-    .join(" ")
-    .toLowerCase();
-
-  if (/\borchestrator|workflow|pipeline\b/.test(text)) return "workflow";
-  if (/\belectron|desktop app|desktop application|gui\b/.test(text)) return "desktop-app";
-  if (/\bmcp server|server\b/.test(text)) return "server";
-  if (/\bcli\b|command line/.test(text)) return "cli";
-  if (/\bplugin\b|extension\b/.test(text)) return "plugin";
-  if (/\bsdk\b/.test(text)) return "sdk";
-  if (/\bframework\b|starter\b|boilerplate\b|platform\b/.test(text)) return "framework";
-  if (/\blibrary\b|package\b|module\b/.test(text)) return "library";
-  if (/\bself-hosted\b|docker-compose|dockerfile|service\b|dashboard\b/.test(text)) return "service";
-  return "general";
-}
-
-function tokenizeSearchResult(repo: SearchResult): Set<string> {
-  return new Set(
-    [
-      repo.fullName,
-      repo.name,
-      repo.description ?? "",
-      repo.language ?? "",
-      ...(repo.topics ?? []),
-    ]
-      .join(" ")
-      .toLowerCase()
-      .replace(/[^\w\s-]/g, " ")
-      .split(/\s+/)
-      .filter(Boolean)
-  );
-}
-
-function preselectCandidates(
-  results: SearchResult[],
-  intent: ParsedIntent,
-  top: number,
-  random: boolean,
-  minStars = 200
-): SearchResult[] {
-  if (random) {
-    return pickResults(results, top, true);
-  }
-
-  // Hard floor: never surface repos below the stars threshold
-  const eligible = results.filter((repo) => repo.stars >= minStars);
-  const pool = eligible.length >= top ? eligible : results;
-
-  const candidatePoolSize = Math.min(Math.max(top * 4, 15), 25, pool.length);
-  const scored = pool
-    .map((repo) => {
-      const tokens = tokenizeSearchResult(repo);
-      const intentTerms = [
-        ...intent.purposeTerms,
-        ...intent.boostTerms,
-        ...intent.concepts,
-        ...intent.displayTerms.flatMap((term) => term.toLowerCase().split(/\s+/)),
-      ].filter(Boolean);
-      const termMatches = [...new Set(intentTerms)].filter((term) => tokens.has(term)).length;
-      const languageBonus =
-        intent.language && repo.language && repo.language.toLowerCase() === intent.language.toLowerCase() ? 2 : 0;
-      const starsBonus =
-        repo.stars >= 50_000
-          ? 8
-          : repo.stars >= 10_000
-            ? 6
-            : repo.stars >= 5_000
-              ? 5
-              : repo.stars >= 1_000
-                ? 4
-                : repo.stars >= 500
-                  ? 3
-                  : repo.stars >= 200
-                    ? 2
-                    : repo.stars >= 100
-                      ? 1
-                      : 0;
-      const forksBonus =
-        repo.forks >= 1_000
-          ? 3
-          : repo.forks >= 100
-            ? 2
-            : repo.forks >= 10
-              ? 1
-              : 0;
-      const repoAgeDays = Math.max(1, Math.floor((Date.now() - repo.createdAt.getTime()) / (24 * 60 * 60 * 1000)));
-      const maturityBonus =
-        repoAgeDays >= 365 * 2
-          ? 3
-          : repoAgeDays >= 365
-            ? 2
-            : repoAgeDays >= 90
-              ? 1
-              : 0;
-      const pushAgeDays = Math.max(1, Math.floor((Date.now() - repo.pushedAt.getTime()) / (24 * 60 * 60 * 1000)));
-      const maintenanceBonus =
-        pushAgeDays <= 30
-          ? 2
-          : pushAgeDays <= 120
-            ? 1
-            : 0;
-      const weakRepoPenalty =
-        repo.stars < 10 && repo.forks === 0 && repoAgeDays < 30
-          ? 4
-          : repo.stars < 25 && repoAgeDays < 45
-            ? 2
-            : 0;
-
-      const prefilterScore =
-        termMatches * 3 +
-        languageBonus +
-        starsBonus +
-        forksBonus +
-        maturityBonus +
-        maintenanceBonus -
-        weakRepoPenalty;
-
-      return { repo, prefilterScore };
-    })
-    .sort((a, b) => b.prefilterScore - a.prefilterScore);
-
-  return scored.slice(0, candidatePoolSize).map((entry) => entry.repo);
-}
-
-async function searchMergedCandidates(
-  githubAdapter: GithubAdapter,
-  search: NonNullable<SearchPlan["search"]>,
-  intent: ParsedIntent
-): Promise<SearchResult[]> {
-  const queries = buildRetrievalQueries(intent, search.query);
-  const merged = new Map<string, SearchResult>();
-
-  for (const query of queries) {
-    const effectiveQuery = buildGitHubQuery({ ...search, query });
-    const batch = await githubAdapter.searchRepos(effectiveQuery, search.sort, 100);
-    for (const repo of batch) {
-      if (!merged.has(repo.fullName)) {
-        merged.set(repo.fullName, repo);
-      }
-    }
-  }
-
-  return [...merged.values()];
-}
-
-type PromptProfile = {
-  label: string;
-  strictQualityFloor: boolean;
-  bestFor: Record<RankedShortlistItem["fitType"], string>;
-};
-
-function buildPromptProfile(intent: ParsedIntent): PromptProfile {
-  const intentText = [intent.normalizedQuery, ...intent.displayTerms, ...intent.purposeTerms, ...intent.concepts]
-    .join(" ")
-    .toLowerCase();
-
-  if (/\bmcp\b/.test(intentText) && /\b(agent|coding|code|developer)\b/.test(intentText)) {
-    return {
-      label: "MCP-based coding assistants",
-      strictQualityFloor: true,
-      bestFor: {
-        "direct match": "teams building MCP-based coding assistants",
-        "adaptable framework": "teams wiring an orchestration layer around MCP coding workflows",
-        "production choice": "teams that want a more established MCP/coding integration starting point",
-        "niche option": "teams exploring a narrower MCP workflow or newer coding assistant",
-        "balanced option": "teams that want a practical MCP/coding starting point without a large platform bet",
-      },
-    };
-  }
-
-  if (intent.concepts.includes("monitoring") && intent.concepts.includes("self-hosted")) {
-    return {
-      label: "self-hosted monitoring for APIs and websites",
-      strictQualityFloor: true,
-      bestFor: {
-        "direct match": "teams running self-hosted API and website monitoring",
-        "adaptable framework": "teams that can extend a broader observability tool to their monitoring workflow",
-        "production choice": "teams that prefer a more proven monitoring project over the most targeted match",
-        "niche option": "teams evaluating a narrower or newer self-hosted monitoring option",
-        "balanced option": "teams that want a credible monitoring option without over-optimizing for one metric",
-      },
-    };
-  }
-
-  if (intent.concepts.includes("local-ai") && intent.concepts.includes("desktop-app")) {
-    return {
-      label: "desktop local LLM apps",
-      strictQualityFloor: false,
-      bestFor: {
-        "direct match": "teams building or adopting desktop local LLM apps",
-        "adaptable framework": "teams that can adapt a desktop AI foundation into a local LLM workflow",
-        "production choice": "teams that prefer a more established local AI project",
-        "niche option": "teams exploring a newer or more specialized local AI app",
-        "balanced option": "teams that want a practical local AI app without chasing the largest framework",
-      },
-    };
-  }
-
-  const label = intent.displayTerms[0] ?? "the request";
-  return {
-    label,
-    strictQualityFloor: false,
-    bestFor: {
-      "direct match": `teams that want the closest match to ${label}`,
-      "adaptable framework": `teams that can customize a framework around ${label}`,
-      "production choice": "teams that prefer a more proven and widely adopted repo",
-      "niche option": `teams evaluating a narrower or newer option in ${label}`,
-      "balanced option": "teams looking for a balanced compromise between fit and maturity",
-    },
-  };
-}
-
-function rankShortlist(results: AnalyzedRepo[], intent: ParsedIntent): RankedShortlistItem[] {
-  const prompt = buildPromptProfile(intent);
-  const scored = results.map((item) => {
-    const tokens = tokenizeRepo(item);
-    const category = extractRepoCategory(item);
-    const promptFit = intent.purposeTerms.filter((term) => tokens.has(term)).length;
-    const intentText = [intent.normalizedQuery, ...intent.displayTerms, ...intent.purposeTerms, ...intent.concepts]
-      .join(" ")
-      .toLowerCase();
-    const mcpQuery = /\bmcp\b/.test(intentText) && /\b(agent|coding|code|developer)\b/.test(intentText);
-    const repoText = [item.search.fullName, item.search.description ?? "", getPrimaryLanguage(item)].join(" ").toLowerCase();
-    const repoDescriptor =
-      /\borchestrator|workflow\b/.test(repoText)
-        ? "orchestration"
-        : /\bstudio|gui|electron|desktop\b/.test(repoText)
-          ? "ui"
-          : /\bserver\b/.test(repoText)
-            ? "server"
-            : /\bcli\b/.test(repoText)
-              ? "cli"
-              : /\bframework|sdk|platform|toolkit\b/.test(repoText)
-                ? "framework"
-                : "general";
-    const mcpRelevance =
-      mcpQuery
-        ? Number(/\bmcp\b|\bmodel context protocol\b/.test(repoText)) +
-          Number(/\b(agent|assistant|orchestrator|workflow)\b/.test(repoText)) +
-          Number(/\b(code|coding|developer|dev)\b/.test(repoText))
-        : 0;
-    const stars = item.search.stars;
-    const forks = item.search.forks;
-    const contributors = getContributorCount(item);
-    const readmeText = (item.readme ?? "").toLowerCase();
-    const rootNames = new Set(item.rootContents.map((entry) => entry.name.toLowerCase()));
-    const readmeFit = intent.purposeTerms.filter((term) => readmeText.includes(term)).length;
-    const topicFit = (item.search.topics ?? []).filter((topic) =>
-      intent.purposeTerms.some((term) => topic.toLowerCase().includes(term))
-    ).length;
-    const repoAgeDays = getRepoAgeDays(item);
-    const repoAgeMonths = Math.max(1, repoAgeDays / 30);
-    const starVelocity = stars / repoAgeMonths;
-    const ageDays = Math.floor((Date.now() - getLastCommit(item).getTime()) / (24 * 60 * 60 * 1000));
-    const activityScore = ageDays <= 14 ? 3 : ageDays <= 60 ? 2 : ageDays <= 180 ? 1 : 0;
-    const adoptionScore =
-      stars >= 20_000 || forks >= 3_000
-        ? 4
-        : stars >= 5_000 || forks >= 750
-          ? 3
-          : stars >= 1_000 || forks >= 200 || contributors >= 25
-            ? 2
-            : stars >= 100 || forks >= 25 || contributors >= 5
-              ? 1
-              : 0;
-    const maturityScore =
-      repoAgeDays >= 365 * 2
-        ? 3
-        : repoAgeDays >= 365
-          ? 2
-          : repoAgeDays >= 180
-            ? 1
-            : 0;
-    const velocityScore = starVelocity >= 500 ? 2 : starVelocity >= 100 ? 1 : 0;
-    const maintainabilityScore =
-      item.metrics && !item.error ? (item.metrics.openIssues <= 50 ? 2 : item.metrics.openIssues <= 200 ? 1 : 0) : 0;
-    const setupSignals =
-      Number(rootNames.has("dockerfile")) +
-      Number(rootNames.has("docker-compose.yml") || rootNames.has("docker-compose.yaml")) +
-      Number(rootNames.has(".env.example")) +
-      Number(rootNames.has("package.json") || rootNames.has("pyproject.toml") || rootNames.has("requirements.txt")) +
-      Number([...rootNames].some((name) => name.startsWith(".github")));
-    const releaseBonus =
-      item.latestRelease
-        ? Math.max(
-            0,
-            Math.floor(
-              2 -
-                (Date.now() - item.latestRelease.publishedAt.getTime()) /
-                  (365 * 24 * 60 * 60 * 1000)
-            )
-          )
-        : 0;
-    const frameworkLike =
-      category === "framework" || category === "sdk" || /\b(framework|sdk|library|toolkit|platform|starter)\b/i.test(item.search.description ?? "");
-
-    const passesQualityFloor = prompt.strictQualityFloor
-      ? ((stars >= 50 && repoAgeDays >= 45 && contributors >= 2) ||
-          (promptFit + readmeFit + topicFit + mcpRelevance >= 3 && (stars >= 20 || forks >= 5) && repoAgeDays >= 30))
-      : (stars >= 10 || forks >= 2 || contributors >= 2 || repoAgeDays >= 30 || promptFit + readmeFit + topicFit >= 2);
-
-    if (!passesQualityFloor) {
-      return null;
-    }
-
-    const fitScore = Math.min(
-      3,
-      promptFit + readmeFit + topicFit + (mcpQuery ? Math.min(2, mcpRelevance) : 0) >= 5
-        ? 3
-        : promptFit + readmeFit + topicFit + (mcpQuery ? Math.min(2, mcpRelevance) : 0) >= 3
-          ? 2
-          : promptFit >= 1 || readmeFit >= 1 || topicFit >= 1 || mcpRelevance >= 1
-            ? 1
-            : 0
-    );
-    const adoptionRubric =
-      stars >= 25_000 || forks >= 2_500 || contributors >= 100
-        ? 3
-        : stars >= 5_000 || forks >= 500 || contributors >= 25
-          ? 2
-          : stars >= 250 || forks >= 25 || contributors >= 5
-            ? 1
-            : 0;
-    const maintenanceRubric =
-      ageDays <= 30
-        ? 2
-        : ageDays <= 120
-          ? 1
-          : 0;
-    const maturityRubric =
-      repoAgeDays >= 365 * 2
-        ? 2
-        : repoAgeDays >= 180
-          ? 1
-          : 0;
-    const bonusRubric = Math.min(1, maintainabilityScore > 0 || velocityScore > 0 ? 1 : 0);
-    const setupRubric = setupSignals >= 3 ? 1 : 0;
-
-    const fitType: RankedShortlistItem["fitType"] =
-      fitScore >= 2
-        ? "direct match"
-        : frameworkLike
-          ? "adaptable framework"
-          : stars >= 5_000
-            ? "production choice"
-            : stars < 500
-              ? "niche option"
-              : "balanced option";
-
-    const descriptorBonus =
-      mcpQuery
-        ? repoDescriptor === "server"
-          ? 0.75
-          : repoDescriptor === "orchestration"
-            ? 0.5
-            : repoDescriptor === "framework"
-              ? 0.25
-              : 0
-        : 0;
-
-    const weightedScore =
-      fitScore +
-      adoptionRubric +
-      maintenanceRubric +
-      maturityRubric +
-      bonusRubric +
-      setupRubric +
-      Math.min(1, releaseBonus) +
-      descriptorBonus;
-
-    const whyParts: string[] = [];
-    if (fitScore >= 3) whyParts.push(`most direct fit for ${prompt.label}`);
-    else if (fitType === "adaptable framework") whyParts.push("adaptable foundation for this workflow");
-    else if (fitType === "production choice") whyParts.push("maturity and adoption are stronger than the rest of the field");
-    else if (fitType === "niche option") whyParts.push("specialized option that matches part of the prompt");
-    else if (descriptorBonus > 0) whyParts.push(`${repoDescriptor} shape matches the workflow`);
-    if (category !== "general") whyParts.push(`category suggests a ${category.replace("-", " ")} product shape`);
-    if (adoptionRubric >= 2) whyParts.push("strong adoption");
-    if (maturityRubric >= 1) whyParts.push("established repo age");
-    if (maintenanceRubric >= 1) whyParts.push("recent maintenance");
-    if (readmeFit >= 1) whyParts.push("README reinforces the use case");
-    if (topicFit >= 1) whyParts.push("repo topics match the prompt");
-    if (setupRubric >= 1) whyParts.push("setup signals look credible");
-    if (releaseBonus >= 1) whyParts.push("release signal is present");
-    if (mcpQuery && mcpRelevance >= 2) whyParts.push("clear MCP/coding relevance");
-
-    let tradeoff: string | null = null;
-    if (fitType === "adaptable framework") tradeoff = "more setup required than a purpose-built tool";
-    else if (fitType === "production choice") tradeoff = "broader scope than the most targeted option";
-    else if (fitType === "niche option") tradeoff = "lower adoption signal than the top picks";
-    else if (repoAgeDays < 180) tradeoff = "project is still relatively new";
-    else if (setupSignals === 0) tradeoff = "setup signals are limited from the root snapshot";
-    else if (!item.latestRelease) tradeoff = "no clear release signal from GitHub releases";
-    else if (fitScore < 2) tradeoff = "fit is broader than the exact prompt";
-
-    let bestFor = prompt.bestFor[fitType];
-    if (mcpQuery) {
-      if (repoDescriptor === "server") {
-        bestFor = "teams integrating a lightweight MCP server into coding workflows";
-      } else if (repoDescriptor === "orchestration") {
-        bestFor = "teams orchestrating multi-agent coding workflows around MCP";
-      } else if (repoDescriptor === "ui") {
-        bestFor = "teams exploring a UI-first coding assistant environment";
-      } else if (repoDescriptor === "framework") {
-        bestFor = "teams building a broader coding-agent platform with MCP support";
-      }
-    } else if (category === "service") {
-      bestFor = `teams that want a runnable service for ${prompt.label}`;
-    } else if (category === "framework") {
-      bestFor = `teams building on top of a framework for ${prompt.label}`;
-    } else if (category === "sdk") {
-      bestFor = `teams integrating ${prompt.label} into a larger product`;
-    } else if (category === "plugin") {
-      bestFor = `teams extending an existing toolchain around ${prompt.label}`;
-    } else if (category === "desktop-app") {
-      bestFor = `teams that want a desktop-first experience for ${prompt.label}`;
-    } else if (category === "cli") {
-      bestFor = `teams that prefer a terminal-first workflow for ${prompt.label}`;
-    } else if (category === "server") {
-      bestFor = `teams that want a backend/server implementation for ${prompt.label}`;
-    } else if (category === "workflow") {
-      bestFor = `teams orchestrating multi-step workflows around ${prompt.label}`;
-    } else if (category === "library") {
-      bestFor = `teams embedding ${prompt.label} through a reusable library`;
-    }
-
-    if (!tradeoff) {
-      if (category === "framework" || category === "sdk") tradeoff = "requires more integration work than a turnkey tool";
-      else if (category === "plugin") tradeoff = "depends on an existing host tool or workflow";
-      else if (category === "library") tradeoff = "better for builders than for users seeking a ready-made app";
-    }
-
-    return {
-      item,
-      score: Math.max(1, Math.min(10, Math.round(weightedScore))),
-      why: whyParts.join("; "),
-      tradeoff,
-      risk: buildRiskSummary(item),
-      bestFor,
-      fitType,
-    };
-  }).filter(Boolean) as RankedShortlistItem[];
-
-  const ranked: RankedShortlistItem[] = [];
-  const seenTypes = new Set<string>();
-  const seenTradeoffs = new Map<string, number>();
-  const seenRiskPatterns = new Map<string, number>();
-  const pool = [...scored];
-
-  while (pool.length > 0) {
-    pool.sort((a, b) => {
-      const aPenalty = seenTypes.has(a.fitType) ? 1.25 : 0;
-      const bPenalty = seenTypes.has(b.fitType) ? 1.25 : 0;
-      const aTradeoffPenalty = a.tradeoff ? (seenTradeoffs.get(a.tradeoff) ?? 0) * 1.1 : 0;
-      const bTradeoffPenalty = b.tradeoff ? (seenTradeoffs.get(b.tradeoff) ?? 0) * 1.1 : 0;
-      const aRiskPenalty = a.risk ? (seenRiskPatterns.get(a.risk) ?? 0) * 0.9 : 0;
-      const bRiskPenalty = b.risk ? (seenRiskPatterns.get(b.risk) ?? 0) * 0.9 : 0;
-      return (b.score - bPenalty - bTradeoffPenalty - bRiskPenalty) - (a.score - aPenalty - aTradeoffPenalty - aRiskPenalty);
-    });
-    const next = pool.shift();
-    if (!next) break;
-    ranked.push(next);
-    seenTypes.add(next.fitType);
-    if (next.tradeoff) {
-      seenTradeoffs.set(next.tradeoff, (seenTradeoffs.get(next.tradeoff) ?? 0) + 1);
-    }
-    if (next.risk) {
-      seenRiskPatterns.set(next.risk, (seenRiskPatterns.get(next.risk) ?? 0) + 1);
-    }
-  }
-
-  return ranked;
 }
 
 function buildRiskSummary(item: AnalyzedRepo): string | null {
@@ -968,6 +405,59 @@ async function writeScoutReport(results: RankedShortlistItem[], summary: string)
   await writeFile("reports/REPO_SCOUT_RESULTS.md", content, "utf8");
 }
 
+// ---------------------------------------------------------------------------
+// Staged-engine adapter
+// Converts the staged pipeline's RankedRepo into the RankedShortlistItem shape
+// the conversational selection/render/report loop already understands.
+// This is the seam that lets the agent reuse the same ranking as the CLI.
+// ---------------------------------------------------------------------------
+
+const ARTIFACT_BEST_FOR: Record<ArtifactType, string> = {
+  framework: "Teams building on top of a framework",
+  library: "Embedding into a larger codebase",
+  cli: "A terminal-first workflow",
+  tool: "A ready-to-use tool",
+  dataset: "Evaluation or benchmarking data",
+  boilerplate: "Starting a new project fast",
+  "tips-content": "Learning and reference material",
+};
+
+function fitTypeFor(entry: RankedRepo): RankedShortlistItem["fitType"] {
+  if (entry.promptFit >= 0.75) return "direct match";
+  if (entry.ownerTier === "Elite" || entry.ownerTier === "Strong") return "production choice";
+  if (entry.artifactType === "framework") return "adaptable framework";
+  if (entry.artifactType === "library") return "niche option";
+  return "balanced option";
+}
+
+function stagedToShortlist(result: StagedSearchResult): RankedShortlistItem[] {
+  return result.results.map((entry) => {
+    const item: AnalyzedRepo = {
+      search: entry.repo,
+      metrics: entry.metrics,
+      error: null,
+      readme: entry.readme,
+      rootContents: [],
+      latestRelease: entry.latestRelease,
+    };
+    const risk =
+      [entry.note, entry.decay === "Fading" || entry.decay === "Slowing" ? `Momentum: ${entry.decay}` : null]
+        .filter(Boolean)
+        .join(" · ") || null;
+    return {
+      item,
+      score: Math.round(entry.finalScore * 100),
+      bestFor: ARTIFACT_BEST_FOR[entry.artifactType] ?? "General use",
+      why: entry.whyThisRepo,
+      tradeoff: entry.alternativesNote,
+      risk,
+      fitType: fitTypeFor(entry),
+    } satisfies RankedShortlistItem;
+  });
+}
+
+type ArtifactType = RankedRepo["artifactType"];
+
 function renderShortlist(results: RankedShortlistItem[]): string {
   const HR = chalk.dim("  " + "─".repeat(60));
   const lbl = (s: string) => chalk.dim(s.padEnd(11));
@@ -1103,19 +593,6 @@ async function promptAfterAnalysis(
 
     output.write(INVALID_SELECTION_MESSAGE + "\n");
   }
-}
-
-function shouldExcludeRepo(repo: SearchResult, query: string, rejected: Set<string>): boolean {
-  if (!rejected.has(repo.fullName)) {
-    return false;
-  }
-
-  const normalizedQuery = query.toLowerCase();
-  return ![
-    repo.fullName.toLowerCase(),
-    repo.owner.toLowerCase(),
-    repo.name.toLowerCase(),
-  ].some((token) => normalizedQuery.includes(token));
 }
 
 async function buildRepoContext(
@@ -1586,38 +1063,6 @@ class AiBrain {
   }
 }
 
-async function analyzePickedRepos(
-  githubAdapter: GithubAdapter,
-  analyzeRepo: AnalyzeRepo,
-  picked: SearchResult[]
-): Promise<AnalyzedRepo[]> {
-  const rows: AnalyzedRepo[] = [];
-
-  for (const item of picked) {
-    output.write(`Analyzing ${item.fullName}...\n`);
-    try {
-      const [metrics, readme, rootContents, latestRelease] = await Promise.all([
-        analyzeRepo.execute(item.owner, item.name, false),
-        githubAdapter.getReadme(item.owner, item.name),
-        githubAdapter.getRootContents(item.owner, item.name),
-        githubAdapter.getLatestRelease(item.owner, item.name),
-      ]);
-      rows.push({ search: item, metrics, error: null, readme, rootContents, latestRelease });
-    } catch (err: unknown) {
-      rows.push({
-        search: item,
-        metrics: null,
-        error: err instanceof Error ? err.message : "Unknown error",
-        readme: null,
-        rootContents: [],
-        latestRelease: null,
-      });
-    }
-  }
-
-  return rows;
-}
-
 async function main() {
   const prisma = new PrismaClient();
   const githubAdapter = new GithubAdapter(requireEnv("GITHUB_TOKEN"));
@@ -1735,134 +1180,62 @@ async function main() {
       }
 
       output.write("Searching GitHub...\n");
-      let results = await searchMergedCandidates(githubAdapter, effectiveSearch, intent);
-      results = results.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
 
-      // Star floor baked into the GitHub query may have killed all results — retry without it
-      if (results.length === 0 && effectiveSearch.minStars > 0) {
-        const relaxed = await searchMergedCandidates(githubAdapter, { ...effectiveSearch, minStars: 0 }, intent);
-        const relaxedFiltered = relaxed.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
-        if (relaxedFiltered.length > 0) {
-          output.write(chalk.dim(`  → No results with ${effectiveSearch.minStars}+ stars — showing best available.\n\n`));
-          results = relaxedFiltered;
-        }
+      // ── Single ranking path: the staged pipeline (same engine as `npm run cli`).
+      // Casts wide, gates aggressively, and returns an honest empty list rather
+      // than padding with weak matches. Replaces the old hand-rolled scorer.
+      let staged: StagedSearchResult;
+      try {
+        staged = await runStagedSearch(githubAdapter, analyzeRepo, userInput, effectiveSearch, {
+          top: plan.search.top,
+          random: plan.search.random,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        output.write(chalk.red(`  Search failed: ${msg}\n`));
+        history.push({ role: "assistant", content: `Search failed: ${msg}` });
+        continue;
       }
 
-      let candidates = preselectCandidates(results, intent, plan.search.top, plan.search.random, sessionPrefs.minStars);
+      // Drop anything already rejected this session.
+      const kept = staged.results.filter((r) => !rejectedRepos.has(r.repo.fullName));
 
-      // Nothing passed the stars floor — ask the user what to sacrifice
-      if (candidates.length === 0 && results.length > 0) {
-        const bestAvailable = [...results].sort((a, b) => b.stars - a.stars)[0];
-        const bestStars = bestAvailable?.stars ?? 0;
+      // Pipeline transparency — the honest funnel the old scorer never showed.
+      const sc = staged.stageCounts;
+      output.write(
+        chalk.dim(
+          `  Pipeline  ${sc.stage1Raw} → ${sc.stage2QualityFloor} → ${sc.stage3PromptFit} → ${sc.stage4Ranked} → ${kept.length}` +
+            `  (raw → quality → fit → ranked → shown)\n`
+        )
+      );
 
-        output.write("\n");
-        output.write(chalk.yellow(`  No repos found with ${sessionPrefs.minStars}+ stars for this search.\n`));
-        output.write(chalk.dim(`  Best available has ${bestStars.toLocaleString()} stars.\n\n`));
-        output.write(chalk.bold("  What would you like to do?\n\n"));
-        output.write(`  ${chalk.cyan("1.")} Lower the stars floor to ${Math.max(50, Math.floor(sessionPrefs.minStars / 2))}+\n`);
-        output.write(`  ${chalk.cyan("2.")} Accept what's available (${bestStars}+ stars)\n`);
-        output.write(`  ${chalk.cyan("3.")} Split the problem — find separate repos for different parts\n`);
-        output.write(`  ${chalk.cyan("4.")} Try a different search angle on the same topic\n`);
-        output.write(`  ${chalk.cyan("5.")} Start a new prompt entirely\n\n`);
-
-        const choice = (await rl.question("> ")).trim();
-
-        if (choice === "1") {
-          const newFloor = Math.max(50, Math.floor(sessionPrefs.minStars / 2));
-          sessionPrefs.minStars = newFloor;
-          effectiveSearch.minStars = newFloor;
-          output.write(chalk.dim(`  → Stars floor lowered to ${newFloor}+. Searching again...\n\n`));
-          candidates = preselectCandidates(results, intent, plan.search.top, plan.search.random, newFloor);
-
-        } else if (choice === "2") {
-          sessionPrefs.minStars = 0;
-          effectiveSearch.minStars = 0;
-          output.write(chalk.dim("  → Accepting all results. Searching again...\n\n"));
-          candidates = preselectCandidates(results, intent, plan.search.top, plan.search.random, 0);
-
-        } else if (choice === "3") {
-          output.write(chalk.cyan.bold("\n  Split search — describe the first part you want to find:\n"));
-          output.write(chalk.dim("  (e.g. 'image classifier for clothing' then separately 'price estimator for vintage items')\n\n"));
-          const splitPrompt = (await rl.question("> ")).trim();
-          if (splitPrompt) {
-            pendingInput = splitPrompt;
-            continue outer;
-          }
-
-        } else if (choice === "4") {
-          output.write(chalk.cyan.bold("\n  Different angle — describe what you're really trying to solve:\n\n"));
-          const newAngle = (await rl.question("> ")).trim();
-          if (newAngle) {
-            pendingInput = newAngle;
-            continue outer;
-          }
-
-        } else if (choice === "5") {
-          output.write(chalk.cyan.bold("\nStarting fresh — what are you looking for?\n\n"));
-          history.length = 0;
-          rejectedRepos.clear();
-          sessionPrefs.skipped.clear();
-          sessionPrefs.minStars = 200;
-          pendingInput = null;
-          continue outer;
-
-        } else {
-          // Unrecognised input — treat as a new prompt
-          if (choice) {
-            pendingInput = choice;
-            continue outer;
-          }
-        }
-      }
-
-      // Still nothing after any adjustments — try a broader query silently before giving up
-      if (candidates.length === 0) {
-        const broaderQuery = buildBroaderSearchQuery(intent);
-        if (broaderQuery && broaderQuery !== effectiveSearch.query) {
-          const broaderResults = await searchMergedCandidates(githubAdapter, { ...effectiveSearch, query: broaderQuery }, intent);
-          const broaderFiltered = broaderResults.filter((repo) => !shouldExcludeRepo(repo, userInput, rejectedRepos));
-          candidates = preselectCandidates(broaderFiltered, intent, plan.search.top, plan.search.random, sessionPrefs.minStars);
-          if (candidates.length > 0) {
-            output.write(chalk.dim(`  → Broadened search to: ${broaderQuery}\n\n`));
-          }
-        }
-      }
-      const hadCandidates = candidates.length > 0;
-
-      output.write("Analyzing results...\n");
-      const analyzed = await analyzePickedRepos(githubAdapter, analyzeRepo, candidates);
-      const response =
-        analyzed.length === 0
-          ? intent.confidence < 0.4
-            ? "I still do not have a confident read on that request. Try specifying the repo category, stack, or deployment style."
-            : hadCandidates
-              ? "I did not find perfect matches, but I found a few plausible repos worth checking."
-            : "GitHub returned no results for that search. Try a broader term — e.g. drop 'claude' and search by the core topic instead."
-          : await brain.respond(history, userInput, effectiveSearch, analyzed);
       const filterText = renderAppliedFilters(inferred.applied);
       if (filterText) {
         output.write(`${filterText}\n`);
       }
-      output.write(`${response}\n`);
-      history.push({ role: "assistant", content: response });
 
-      if (analyzed.length === 0 && !hadCandidates) {
+      // Honest empty state — say so instead of returning junk.
+      if (kept.length === 0) {
+        const emptyMsg =
+          intent.confidence < 0.4
+            ? "I do not have a confident read on that request yet. Try naming the repo category, stack, or deployment style."
+            : "Nothing cleared the quality and prompt-fit gates for that query. Try a broader angle, or loosen how specific the ask is.";
+        output.write(`${emptyMsg}\n`);
+        history.push({ role: "assistant", content: emptyMsg });
         continue;
       }
 
-      const shortlist = rankShortlist(
-        analyzed.length > 0
-          ? analyzed
-          : candidates.map((search) => ({
-              search,
-              metrics: null,
-              error: null,
-              readme: null,
-              rootContents: [],
-              latestRelease: null,
-            })),
-        intent
-      ).slice(0, plan.search.top);
+      const shortlist = stagedToShortlist({ ...staged, results: kept }).slice(0, plan.search.top);
+      const analyzed = shortlist.map((entry) => entry.item);
+      const topConfidence = kept[0]?.confidence ?? "Low";
+
+      let response = await brain.respond(history, userInput, effectiveSearch, analyzed);
+      if (topConfidence === "Low") {
+        response +=
+          "\n(Low confidence — these cleared the gates, but the candidate pool was thin. Worth a sanity check.)";
+      }
+      output.write(`${response}\n`);
+      history.push({ role: "assistant", content: response });
       const shortlistEntries = buildSeenEntries(userInput, shortlist);
       seenRepos.push(...shortlistEntries);
       shortlistHistory.push({ prompt: userInput, repos: shortlistEntries });
