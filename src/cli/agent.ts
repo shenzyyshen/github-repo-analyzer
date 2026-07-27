@@ -9,9 +9,11 @@ import OpenAI from "openai";
 import { PrismaClient } from "@prisma/client";
 import { GithubAdapter } from "../adapters/github/GithubAdapter.js";
 import { PrismaAdapter } from "../adapters/database/PrismaAdapter.js";
+import { FileSessionStore } from "../adapters/session/FileSessionStore.js";
 import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { Metrics } from "../domain/entities/Metrics.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
+import type { SeenRepoEntry, ShortlistHistoryEntry } from "../domain/entities/SessionState.js";
 import type { RepoReleaseInfo, RepoRootEntry } from "../ports/RepoApiPort.js";
 import {
   buildRetrievalQueries,
@@ -25,6 +27,7 @@ import {
   shouldClarifyBeforeSearch,
   type SessionPreferences,
 } from "../domain/usecases/ParseIntent.js";
+import { buildSeenEntries, renderSeenRepos, renderShortlistHistory } from "../domain/usecases/ManageSession.js";
 import { runStagedSearch, type RankedRepo, type StagedSearchResult } from "./stagedSearch.js";
 
 type Role = "user" | "assistant";
@@ -94,22 +97,6 @@ type RankedShortlistItem = {
   fitType: "direct match" | "production choice" | "adaptable framework" | "niche option" | "balanced option";
 };
 
-type SeenRepoEntry = {
-  prompt: string;
-  fullName: string;
-  url: string;
-};
-
-type ShortlistHistoryEntry = {
-  prompt: string;
-  repos: SeenRepoEntry[];
-};
-
-type SessionState = {
-  seenRepos: SeenRepoEntry[];
-  shortlistHistory: ShortlistHistoryEntry[];
-};
-
 type SelectionChoice =
   | { kind: "pick"; index: number }
   | { kind: "none" }
@@ -126,7 +113,6 @@ type TextChoice =
   | { kind: "exit" };
 
 const INVALID_SELECTION_MESSAGE = "Enter a number, or type 're run', 'new', 'none', 'seen', 'history', or 'quit'.";
-const SESSION_FILE = ".codex/session.json";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -316,56 +302,6 @@ function buildShortlistNames(results: Array<AnalyzedRepo | RankedShortlistItem>)
     .slice(0, 3)
     .map((item) => item.search.fullName)
     .join(", ");
-}
-
-function buildSeenEntries(prompt: string, shortlist: RankedShortlistItem[]): SeenRepoEntry[] {
-  return shortlist.map((ranked) => ({
-    prompt,
-    fullName: ranked.item.search.fullName,
-    url: buildRepoUrl(ranked.item.search.fullName),
-  }));
-}
-
-function renderSeenRepos(entries: SeenRepoEntry[]): string {
-  if (entries.length === 0) {
-    return "No repos have been shown in this session yet.\n";
-  }
-
-  return [
-    "Seen repos:",
-    ...entries.map((entry, index) => `${index + 1}. ${entry.prompt}\n   ${entry.fullName}\n   ${entry.url}`),
-    "",
-  ].join("\n");
-}
-
-function renderShortlistHistory(entries: ShortlistHistoryEntry[]): string {
-  if (entries.length === 0) {
-    return "No shortlist history is available yet.\n";
-  }
-
-  return [
-    "Shortlist history:",
-    ...entries.map((entry, index) => `${index + 1}. ${entry.prompt}\n   ${entry.repos.map((repo) => repo.fullName).join(", ")}`),
-    "",
-  ].join("\n");
-}
-
-async function loadSessionState(): Promise<SessionState> {
-  try {
-    const raw = await readFile(SESSION_FILE, "utf8");
-    const parsed = JSON.parse(raw) as Partial<SessionState>;
-    return {
-      seenRepos: Array.isArray(parsed.seenRepos) ? parsed.seenRepos : [],
-      shortlistHistory: Array.isArray(parsed.shortlistHistory) ? parsed.shortlistHistory : [],
-    };
-  } catch {
-    return { seenRepos: [], shortlistHistory: [] };
-  }
-}
-
-async function saveSessionState(state: SessionState): Promise<void> {
-  await mkdir(".codex", { recursive: true });
-  await writeFile(SESSION_FILE, JSON.stringify(state, null, 2), "utf8");
 }
 
 async function writeScoutReport(results: RankedShortlistItem[], summary: string): Promise<void> {
@@ -1068,9 +1004,10 @@ async function main() {
   const githubAdapter = new GithubAdapter(requireEnv("GITHUB_TOKEN"));
   const prismaAdapter = new PrismaAdapter(prisma);
   const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter);
+  const sessionStore = new FileSessionStore();
   const brain = new AiBrain();
   const rl = createInterface({ input, output });
-  const persistedSession = await loadSessionState();
+  const persistedSession = await sessionStore.load();
   const history: Turn[] = [];
   const rejectedRepos = new Set<string>();
   const seenRepos: SeenRepoEntry[] = [...persistedSession.seenRepos];
@@ -1236,10 +1173,13 @@ async function main() {
       }
       output.write(`${response}\n`);
       history.push({ role: "assistant", content: response });
-      const shortlistEntries = buildSeenEntries(userInput, shortlist);
+      const shortlistEntries = buildSeenEntries(
+        userInput,
+        shortlist.map((ranked) => ranked.item.search.fullName)
+      );
       seenRepos.push(...shortlistEntries);
       shortlistHistory.push({ prompt: userInput, repos: shortlistEntries });
-      await saveSessionState({ seenRepos, shortlistHistory });
+      await sessionStore.save({ seenRepos, shortlistHistory });
       await writeScoutReport(shortlist, response);
       output.write(`${renderShortlist(shortlist)}\n`);
 
