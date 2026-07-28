@@ -5,11 +5,12 @@ import type { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { RepoApiPort, RepoReleaseInfo, RepoRootEntry } from "../ports/RepoApiPort.js";
 import type { RepoIntelligencePort } from "../ports/RepoIntelligencePort.js";
 import {
-  buildRetrievalQueries,
   inferFilters,
   type ParsedIntent,
   type SearchInput,
 } from "../domain/usecases/ParseIntent.js";
+import { DiscoverRepos, type EnrichedRepo } from "../domain/usecases/DiscoverRepos.js";
+import { clamp, daysSince, normalizeText, tokenizeRepo, unique } from "../domain/shared/pipelineUtils.js";
 import {
   CONFIDENCE_THRESHOLDS,
   DOMAIN_SPEED_TERMS,
@@ -25,7 +26,6 @@ import {
   MAINTENANCE_SIGNALS,
   OWNER_TIER_SCORES,
   OWNER_TIER_THRESHOLDS,
-  PRESELECT,
   PROMPT_FIT_THRESHOLDS,
   PROMPT_FIT_WEIGHTS,
   RANKING_WEIGHTS,
@@ -71,15 +71,6 @@ export type IntentClassification = {
   freshnessOverride: FreshnessOverride;
   ownerPreference: OwnerPreference;
   confidence: number;
-};
-
-type EnrichedRepo = {
-  search: SearchResult;
-  metrics: Metrics | null;
-  readme: string | null;
-  rootContents: RepoRootEntry[];
-  latestRelease: RepoReleaseInfo | null;
-  analysisError: string | null;
 };
 
 type PromptFitBreakdown = {
@@ -151,35 +142,6 @@ export type StagedSearchResult = {
 };
 
 
-function buildGitHubQuery(search: SearchInput): string {
-  const parts: string[] = [search.query];
-  if (search.language) parts.push(`language:${search.language}`);
-  if (search.minStars > 0) parts.push(`stars:>${search.minStars}`);
-  if (search.since) parts.push(`pushed:>${search.since}`);
-  if (search.license) parts.push(`license:${search.license}`);
-  return parts.join(" ");
-}
-
-function normalizeText(value: string): string[] {
-  return value
-    .toLowerCase()
-    .replace(/[^\w\s-]/g, " ")
-    .split(/\s+/)
-    .filter(Boolean);
-}
-
-function unique<T>(values: T[]): T[] {
-  return [...new Set(values)];
-}
-
-function clamp(value: number, min = 0, max = 1): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-function daysSince(date: Date | null | undefined): number {
-  if (!date) return Number.POSITIVE_INFINITY;
-  return Math.max(0, Math.floor((Date.now() - date.getTime()) / (24 * 60 * 60 * 1000)));
-}
 
 function inferArtifactType(query: string, intent: ParsedIntent): ArtifactType {
   const text = [query, intent.normalizedQuery, ...intent.displayTerms, ...intent.purposeTerms].join(" ").toLowerCase();
@@ -229,19 +191,6 @@ function classifyIntent(
     ownerPreference,
     confidence: clamp(intent.confidence, 0, 1),
   };
-}
-
-function tokenizeRepo(repo: SearchResult, readme: string | null): Set<string> {
-  return new Set(
-    normalizeText([
-      repo.fullName,
-      repo.name,
-      repo.description ?? "",
-      repo.language ?? "",
-      ...(repo.topics ?? []),
-      readme ?? "",
-    ].join(" "))
-  );
 }
 
 function inferRepoArtifactType(repo: SearchResult, readme: string | null, rootContents: RepoRootEntry[]): ArtifactType {
@@ -528,59 +477,6 @@ function stage2GateReason(
   return null;
 }
 
-async function enrichRepo(
-  repoApiPort: RepoApiPort,
-  analyzeRepo: AnalyzeRepo,
-  search: SearchResult
-): Promise<EnrichedRepo> {
-  const [metrics, readme, rootContents, latestRelease] = await Promise.allSettled([
-    analyzeRepo.execute(search.owner, search.name, false),
-    repoApiPort.getReadme(search.owner, search.name),
-    repoApiPort.getRootContents(search.owner, search.name),
-    repoApiPort.getLatestRelease(search.owner, search.name),
-  ]);
-
-  return {
-    search,
-    metrics: metrics.status === "fulfilled" ? metrics.value : null,
-    readme: readme.status === "fulfilled" ? readme.value : null,
-    rootContents: rootContents.status === "fulfilled" ? rootContents.value : [],
-    latestRelease: latestRelease.status === "fulfilled" ? latestRelease.value : null,
-    analysisError: metrics.status === "rejected" ? String(metrics.reason) : null,
-  };
-}
-
-function preselectCandidates(results: SearchResult[], intent: ParsedIntent, top: number, random: boolean): SearchResult[] {
-  if (random) {
-    const copy = [...results];
-    for (let i = copy.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [copy[i], copy[j]] = [copy[j], copy[i]];
-    }
-    return copy.slice(0, Math.min(top * 4, copy.length));
-  }
-
-  const candidatePoolSize = Math.min(Math.max(top * PRESELECT.poolMultiplier, PRESELECT.poolMin), PRESELECT.poolCap, results.length);
-  return results
-    .map((repo) => {
-      const tokens = tokenizeRepo(repo, null);
-      const terms = unique([
-        ...intent.purposeTerms,
-        ...intent.concepts,
-        ...intent.displayTerms.flatMap((term) => normalizeText(term)),
-      ]);
-      const termMatches = terms.filter((term) => tokens.has(term)).length;
-      const languageBonus =
-        intent.language && repo.language && intent.language.toLowerCase() === repo.language.toLowerCase() ? 2 : 0;
-      const starsBonus = PRESELECT.starBonuses.find((b) => repo.stars >= b.minStars)?.bonus ?? 0;
-      const activityBonus = daysSince(repo.pushedAt) <= PRESELECT.activityBonus.recentDays ? PRESELECT.activityBonus.recentBonus : daysSince(repo.pushedAt) <= PRESELECT.activityBonus.activeDays ? PRESELECT.activityBonus.activeBonus : 0;
-      return { repo, score: termMatches * PRESELECT.termMatchWeight + languageBonus + starsBonus + activityBonus };
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, candidatePoolSize)
-    .map((entry) => entry.repo);
-}
-
 const EMPTY_INTENT: ParsedIntent = {
   language: null,
   since: null,
@@ -637,21 +533,12 @@ export async function runStagedSearch(
 ): Promise<StagedSearchResult> {
   const { search, applied, intent } = inferFilters(originalQuery, baseSearch);
   const classification = classifyIntent(originalQuery, intent, options.requestedMode);
-  const queries = buildRetrievalQueries(intent, search.query);
-  const merged = new Map<string, SearchResult>();
 
-  for (const query of queries) {
-    const batch = await repoApiPort.searchRepos(buildGitHubQuery({ ...search, query }), search.sort, 100);
-    for (const repo of batch) {
-      if (!merged.has(repo.fullName)) merged.set(repo.fullName, repo);
-      if (merged.size >= 200) break;
-    }
-    if (merged.size >= 200) break;
-  }
-
-  const stage1Raw = [...merged.values()];
-  const candidates = preselectCandidates(stage1Raw, intent, options.top, Boolean(options.random));
-  const enriched = await Promise.all(candidates.map((repo) => enrichRepo(repoApiPort, analyzeRepo, repo)));
+  const discoverRepos = new DiscoverRepos(repoApiPort, analyzeRepo);
+  const { stage1Raw, enriched } = await discoverRepos.execute(intent, search, {
+    top: options.top,
+    random: options.random,
+  });
 
   const qualityPassed = enriched.filter((repo) => {
     const ownerTier = ownerTierFor(repo.search);
