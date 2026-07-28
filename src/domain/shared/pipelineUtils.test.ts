@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { clamp, daysSince, normalizeText, tokenizeRepo, unique } from "./pipelineUtils.js";
+import {
+  clamp,
+  daysSince,
+  domainFreshnessThresholds,
+  keywordOverlap,
+  normalizeText,
+  ownerTierFor,
+  ownerTierScore,
+  tokenizeRepo,
+  unique,
+} from "./pipelineUtils.js";
 import type { SearchResult } from "../entities/SearchResult.js";
+import { parseIntent } from "../usecases/ParseIntent.js";
 
 describe("normalizeText", () => {
   it("lowercases, strips punctuation, and splits on whitespace", () => {
@@ -65,5 +76,54 @@ describe("tokenizeRepo", () => {
   it("includes readme tokens when a readme is provided", () => {
     const tokens = tokenizeRepo(baseRepo, "Deploy with Docker Compose");
     expect(tokens.has("docker")).toBe(true);
+  });
+});
+
+describe("ownerTierFor", () => {
+  it("ranks a known elite owner as Elite regardless of stars", () => {
+    expect(ownerTierFor({ ...baseRepo, owner: "anthropic", stars: 10 })).toBe("Elite");
+  });
+
+  it("ranks a high-star unknown owner as Elite by star threshold", () => {
+    expect(ownerTierFor({ ...baseRepo, owner: "randodev", stars: 60_000 })).toBe("Elite");
+  });
+
+  it("ranks a mid-star owner as Strong", () => {
+    expect(ownerTierFor({ ...baseRepo, owner: "randodev", stars: 6_000 })).toBe("Strong");
+  });
+
+  it("ranks a low-signal, inactive owner as Weak", () => {
+    expect(
+      ownerTierFor({ ...baseRepo, owner: "randodev", stars: 5, forks: 0, pushedAt: new Date("2020-01-01") })
+    ).toBe("Weak");
+  });
+});
+
+describe("ownerTierScore", () => {
+  it("orders tiers Elite > Strong > Promising > Weak", () => {
+    expect(ownerTierScore("Elite")).toBeGreaterThan(ownerTierScore("Strong"));
+    expect(ownerTierScore("Strong")).toBeGreaterThan(ownerTierScore("Promising"));
+    expect(ownerTierScore("Promising")).toBeGreaterThan(ownerTierScore("Weak"));
+  });
+});
+
+describe("domainFreshnessThresholds", () => {
+  it("returns tighter thresholds for fast-moving domains than slow ones", () => {
+    const fast = domainFreshnessThresholds("fast");
+    const slow = domainFreshnessThresholds("slow");
+    expect(fast.disqualify).toBeLessThan(slow.disqualify);
+  });
+});
+
+describe("keywordOverlap", () => {
+  it("returns 0 when the intent carries no purpose/concept terms", () => {
+    const intent = parseIntent("x");
+    expect(keywordOverlap(intent, baseRepo, null)).toBe(0);
+  });
+
+  it("returns a positive overlap when repo text matches intent terms", () => {
+    const intent = parseIntent("self-hosted widget");
+    const overlap = keywordOverlap(intent, baseRepo, null);
+    expect(overlap).toBeGreaterThan(0);
   });
 });

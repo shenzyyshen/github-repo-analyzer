@@ -10,7 +10,31 @@ import {
   type SearchInput,
 } from "../domain/usecases/ParseIntent.js";
 import { DiscoverRepos, type EnrichedRepo } from "../domain/usecases/DiscoverRepos.js";
-import { clamp, daysSince, normalizeText, tokenizeRepo, unique } from "../domain/shared/pipelineUtils.js";
+import { applyQualityGates } from "../domain/usecases/ApplyQualityGates.js";
+import {
+  clamp,
+  daysSince,
+  domainFreshnessThresholds,
+  keywordOverlap,
+  normalizeText,
+  ownerTierFor,
+  ownerTierScore,
+  tokenizeRepo,
+  unique,
+} from "../domain/shared/pipelineUtils.js";
+import type {
+  ArtifactType,
+  ConfidenceLabel,
+  DecayLabel,
+  DependencyHealth,
+  DomainSpeed,
+  FreshnessOverride,
+  IntentClassification,
+  IntentMode,
+  OwnerPreference,
+  OwnerTier,
+  Specificity,
+} from "../domain/entities/IntentClassification.js";
 import {
   CONFIDENCE_THRESHOLDS,
   DOMAIN_SPEED_TERMS,
@@ -18,59 +42,23 @@ import {
   FRESHNESS_OVERRIDE_DELTA,
   FRESHNESS_PUSH_SCORES,
   FRESHNESS_RELEASE_SCORES,
-  FRESHNESS_THRESHOLDS,
   HEALTH_DEPENDENCY_SCORES,
   HEALTH_SCORE_FLOOR,
   HEALTH_WEIGHTS,
-  KNOWN_ELITE_OWNERS,
   MAINTENANCE_SIGNALS,
-  OWNER_TIER_SCORES,
-  OWNER_TIER_THRESHOLDS,
   PROMPT_FIT_THRESHOLDS,
   PROMPT_FIT_WEIGHTS,
   RANKING_WEIGHTS,
   README_LENGTH_TARGET,
   README_QUALITY_WEIGHTS,
-  STAGE2,
-  STAR_FLOOR_BASE,
-  STAR_FLOOR_ELITE,
-  STAR_FLOOR_STRONG,
   STARS_VELOCITY_DIVISOR,
 } from "../config/thresholds.js";
-
-export type IntentMode = "best_match" | "best_shortlist" | "watch";
-export type DomainSpeed = "fast" | "medium" | "slow";
-export type ArtifactType =
-  | "library"
-  | "framework"
-  | "cli"
-  | "tips-content"
-  | "dataset"
-  | "boilerplate"
-  | "tool";
-export type FreshnessOverride = "strict" | "relaxed" | "none";
-export type OwnerPreference = "company-backed" | "community" | "any";
-export type Specificity = "narrow" | "broad";
-export type OwnerTier = "Elite" | "Strong" | "Promising" | "Weak";
-export type DecayLabel = "Healthy" | "Slowing" | "Fading" | "Abandoned";
-export type DependencyHealth = "Clean" | "Minor risk" | "Supply chain risk";
-export type ConfidenceLabel = "High" | "Medium" | "Low";
 
 export type StagedSearchOptions = {
   requestedMode?: IntentMode;
   top: number;
   random?: boolean;
   explain?: boolean;
-};
-
-export type IntentClassification = {
-  artifactType: ArtifactType;
-  domainSpeed: DomainSpeed;
-  specificity: Specificity;
-  intentMode: IntentMode;
-  freshnessOverride: FreshnessOverride;
-  ownerPreference: OwnerPreference;
-  confidence: number;
 };
 
 type PromptFitBreakdown = {
@@ -211,46 +199,6 @@ function inferRepoArtifactType(repo: SearchResult, readme: string | null, rootCo
   return "tool";
 }
 
-function ownerTierFor(repo: SearchResult): OwnerTier {
-  const owner = repo.owner.toLowerCase();
-  if (KNOWN_ELITE_OWNERS.has(owner) || repo.stars >= OWNER_TIER_THRESHOLDS.elite.stars || repo.forks >= OWNER_TIER_THRESHOLDS.elite.forks) {
-    return "Elite";
-  }
-  if (repo.stars >= OWNER_TIER_THRESHOLDS.strong.stars || repo.forks >= OWNER_TIER_THRESHOLDS.strong.forks) {
-    return "Strong";
-  }
-  if (repo.stars >= OWNER_TIER_THRESHOLDS.promising.stars || repo.forks >= OWNER_TIER_THRESHOLDS.promising.forks || daysSince(repo.pushedAt) <= OWNER_TIER_THRESHOLDS.promising.activeDays) {
-    return "Promising";
-  }
-  return "Weak";
-}
-
-function ownerTierScore(tier: OwnerTier): number {
-  return OWNER_TIER_SCORES[tier];
-}
-
-function domainFreshnessThresholds(speed: DomainSpeed): { soft: number; hard: number; disqualify: number } {
-  return FRESHNESS_THRESHOLDS[speed];
-}
-
-function minimumStarsFor(speed: DomainSpeed, ownerTier: OwnerTier): number {
-  const base = STAR_FLOOR_BASE[speed];
-  if (ownerTier === "Elite") return Math.max(STAR_FLOOR_ELITE.min, Math.floor(base / STAR_FLOOR_ELITE.divisor));
-  if (ownerTier === "Strong") return Math.max(STAR_FLOOR_STRONG.min, Math.floor(base * STAR_FLOOR_STRONG.multiplier));
-  return base;
-}
-
-function keywordOverlap(intent: ParsedIntent, repo: SearchResult, readme: string | null): number {
-  const tokens = tokenizeRepo(repo, readme);
-  const terms = unique([
-    ...intent.purposeTerms,
-    ...intent.concepts,
-    ...intent.displayTerms.flatMap((term) => normalizeText(term)),
-  ]);
-  if (terms.length === 0) return 0;
-  const matches = terms.filter((term) => tokens.has(term)).length;
-  return matches / terms.length;
-}
 
 function promptFitBreakdown(
   intent: ParsedIntent,
@@ -456,27 +404,6 @@ function confidenceLabel(stageCounts: StagedSearchResult["stageCounts"], topScor
   return "High";
 }
 
-function stage2GateReason(
-  repo: EnrichedRepo,
-  classification: IntentClassification,
-  intent: ParsedIntent,
-  ownerTier: OwnerTier
-): string | null {
-  const overlap = keywordOverlap(intent, repo.search, repo.readme);
-  const thresholds = domainFreshnessThresholds(classification.domainSpeed);
-  const readmeLength = repo.readme?.trim().length ?? 0;
-  const eliteReadmeExemption = ownerTier === "Elite" && repo.search.stars >= STAGE2.eliteReadmeExemptionMinStars;
-
-  if (repo.search.archived) return "archived";
-  if (repo.search.isFork) return "fork";
-  if (!repo.readme && !eliteReadmeExemption) return "missing README";
-  if (readmeLength < STAGE2.minReadmeLength && !eliteReadmeExemption) return "README too thin";
-  if (overlap < STAGE2.minKeywordOverlap) return "README/prompt overlap too weak";
-  if (daysSince(repo.search.pushedAt) > thresholds.disqualify) return "stale for domain";
-  if (repo.search.stars < minimumStarsFor(classification.domainSpeed, ownerTier)) return "below star floor";
-  return null;
-}
-
 const EMPTY_INTENT: ParsedIntent = {
   language: null,
   since: null,
@@ -540,10 +467,7 @@ export async function runStagedSearch(
     random: options.random,
   });
 
-  const qualityPassed = enriched.filter((repo) => {
-    const ownerTier = ownerTierFor(repo.search);
-    return !stage2GateReason(repo, classification, intent, ownerTier);
-  });
+  const qualityPassed = applyQualityGates(enriched, classification, intent);
 
   const promptFitThreshold = PROMPT_FIT_THRESHOLDS[classification.specificity];
   const promptFitPassed = qualityPassed

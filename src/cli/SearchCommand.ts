@@ -2,7 +2,8 @@ import type { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import type { RepoApiPort } from "../ports/RepoApiPort.js";
 import type { RepoIntelligencePort } from "../ports/RepoIntelligencePort.js";
 import type { QueryTranslator } from "../ai/QueryTranslator.js";
-import { renderStagedSearch, runStagedSearch, type IntentMode } from "./stagedSearch.js";
+import type { IntentMode } from "../domain/entities/IntentClassification.js";
+import { renderStagedSearch, runStagedSearch } from "./stagedSearch.js";
 
 type SearchOptions = {
   language?: string;
