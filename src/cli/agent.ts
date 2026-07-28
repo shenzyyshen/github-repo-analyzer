@@ -28,7 +28,8 @@ import {
   type SessionPreferences,
 } from "../domain/usecases/ParseIntent.js";
 import { buildSeenEntries, renderSeenRepos, renderShortlistHistory } from "../domain/usecases/ManageSession.js";
-import { runStagedSearch, type RankedRepo, type StagedSearchResult } from "./stagedSearch.js";
+import type { RankedRepo } from "../domain/usecases/ScoreAndRank.js";
+import { runStagedSearch, type StagedSearchResult } from "./stagedSearch.js";
 
 type Role = "user" | "assistant";
 
