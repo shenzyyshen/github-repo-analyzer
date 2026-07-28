@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import "dotenv/config";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { execSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
@@ -10,11 +9,14 @@ import { PrismaClient } from "@prisma/client";
 import { GithubAdapter } from "../adapters/github/GithubAdapter.js";
 import { PrismaAdapter } from "../adapters/database/PrismaAdapter.js";
 import { FileSessionStore } from "../adapters/session/FileSessionStore.js";
+import { MarkdownReportWriter } from "../adapters/reports/MarkdownReportWriter.js";
 import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
+import { AnalyzeRepoDeep } from "../domain/usecases/AnalyzeRepoDeep.js";
 import type { Metrics } from "../domain/entities/Metrics.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
 import type { SeenRepoEntry, ShortlistHistoryEntry } from "../domain/entities/SessionState.js";
 import type { RepoReleaseInfo, RepoRootEntry } from "../ports/RepoApiPort.js";
+import type { ReportWriterPort } from "../ports/ReportWriterPort.js";
 import {
   buildRetrievalQueries,
   buildClarificationPrompt,
@@ -36,31 +38,6 @@ type Role = "user" | "assistant";
 type Turn = {
   role: Role;
   content: string;
-};
-
-type RepoContext = {
-  repo: SearchResult;
-  metrics: Metrics;
-  repoData: {
-    fullName: string;
-    description: string | null;
-    defaultBranch: string;
-    forks: number;
-    openIssues: number;
-    createdAt: Date;
-    pushedAt: Date;
-  };
-  languages: Record<string, number>;
-  contributors: number;
-  verifiedOpenIssues: number;
-  readme: string | null;
-  rootContents: RepoRootEntry[];
-  latestRelease: RepoReleaseInfo | null;
-};
-
-type ScoutSelectionContext = {
-  whyRecommended: string;
-  score: number | null;
 };
 
 type SearchPlan = {
@@ -249,43 +226,6 @@ function buildRiskSummary(item: AnalyzedRepo): string | null {
   return null;
 }
 
-function buildRiskDetails(context: RepoContext): string[] {
-  const risks: string[] = [];
-  const ageDays = Math.floor((Date.now() - context.metrics.lastCommit.getTime()) / (24 * 60 * 60 * 1000));
-  const issuePressure = context.verifiedOpenIssues / Math.max(context.metrics.stars, 1);
-  const rootNames = new Set(context.rootContents.map((entry) => entry.name.toLowerCase()));
-  const setupSignals =
-    Number(rootNames.has("dockerfile")) +
-    Number(rootNames.has("docker-compose.yml") || rootNames.has("docker-compose.yaml")) +
-    Number(rootNames.has(".env.example")) +
-    Number(rootNames.has("package.json") || rootNames.has("pyproject.toml") || rootNames.has("requirements.txt")) +
-    Number([...rootNames].some((name) => name.startsWith(".github")));
-
-  if (issuePressure > 0.35 && context.contributors < 5) {
-    risks.push("Issue pressure looks high relative to the repo's size and contributor depth.");
-  } else if (issuePressure > 0.1 && context.contributors < 3) {
-    risks.push("Issue pressure is non-trivial and maintainer depth is limited.");
-  }
-
-  if (ageDays > 180) {
-    risks.push("Recent maintenance activity is weak.");
-  }
-
-  if (!context.latestRelease) {
-    risks.push("No GitHub release signal is present.");
-  }
-
-  if (context.contributors <= 1) {
-    risks.push("Contributor depth is shallow, which increases bus-factor risk.");
-  }
-
-  if (setupSignals <= 1) {
-    risks.push("Setup and operational signals are limited from the root snapshot.");
-  }
-
-  return risks;
-}
-
 function buildShortlistNames(results: Array<AnalyzedRepo | RankedShortlistItem>): string {
   const unwrap = (entry: AnalyzedRepo | RankedShortlistItem) => ("item" in entry ? entry.item : entry);
   const successful = results
@@ -305,9 +245,11 @@ function buildShortlistNames(results: Array<AnalyzedRepo | RankedShortlistItem>)
     .join(", ");
 }
 
-async function writeScoutReport(results: RankedShortlistItem[], summary: string): Promise<void> {
-  await mkdir("reports", { recursive: true });
-
+async function writeScoutReport(
+  reportWriterPort: ReportWriterPort,
+  results: RankedShortlistItem[],
+  summary: string
+): Promise<void> {
   const timestamp = new Date().toISOString();
   const header = `# Repo Scout Results\n\nGenerated: ${timestamp}\n`;
   const tableHeader = [
@@ -339,7 +281,7 @@ async function writeScoutReport(results: RankedShortlistItem[], summary: string)
     "",
   ].join("\n");
 
-  await writeFile("reports/REPO_SCOUT_RESULTS.md", content, "utf8");
+  await reportWriterPort.writeScoutReport(content);
 }
 
 // ---------------------------------------------------------------------------
@@ -530,259 +472,6 @@ async function promptAfterAnalysis(
 
     output.write(INVALID_SELECTION_MESSAGE + "\n");
   }
-}
-
-async function buildRepoContext(
-  githubAdapter: GithubAdapter,
-  analyzeRepo: AnalyzeRepo,
-  repo: SearchResult
-): Promise<RepoContext> {
-  const [metrics, repoData, languages, contributors, verifiedOpenIssues, readme, rootContents, latestRelease] = await Promise.all([
-    analyzeRepo.execute(repo.owner, repo.name, true),
-    githubAdapter.getRepo(repo.owner, repo.name),
-    githubAdapter.getLanguages(repo.owner, repo.name),
-    githubAdapter.getContributors(repo.owner, repo.name),
-    githubAdapter.getIssues(repo.owner, repo.name),
-    githubAdapter.getReadme(repo.owner, repo.name),
-    githubAdapter.getRootContents(repo.owner, repo.name),
-    githubAdapter.getLatestRelease(repo.owner, repo.name),
-  ]);
-
-  return {
-    repo,
-    metrics,
-    repoData: {
-      fullName: repoData.fullName,
-      description: repoData.description,
-      defaultBranch: repoData.defaultBranch,
-      forks: repoData.forks,
-      openIssues: repoData.openIssues,
-      createdAt: repoData.createdAt,
-      pushedAt: repoData.pushedAt,
-    },
-    languages,
-    contributors,
-    verifiedOpenIssues,
-    readme,
-    rootContents,
-    latestRelease,
-  };
-}
-
-function detectStackSignals(rootContents: RepoRootEntry[], readme: string | null): string[] {
-  const names = new Set(rootContents.map((entry) => entry.name.toLowerCase()));
-  const readmeText = readme?.toLowerCase() ?? "";
-  const signals: string[] = [];
-
-  if (names.has("package.json")) signals.push("Node.js / JavaScript or TypeScript");
-  if (names.has("tsconfig.json")) signals.push("TypeScript");
-  if (names.has("pyproject.toml") || names.has("requirements.txt")) signals.push("Python");
-  if (names.has("go.mod")) signals.push("Go");
-  if (names.has("cargo.toml")) signals.push("Rust");
-  if (names.has("dockerfile")) signals.push("Docker");
-  if (names.has("docker-compose.yml") || names.has("docker-compose.yaml")) signals.push("Docker Compose");
-  if (names.has(".env.example")) signals.push("environment-template provided");
-  if ([...names].some((name) => name.startsWith(".github"))) signals.push("GitHub Actions / CI config");
-  if (readmeText.includes("typescript") && !signals.includes("TypeScript")) signals.push("TypeScript");
-  if (readmeText.includes("python") && !signals.includes("Python")) signals.push("Python");
-
-  return [...new Set(signals)];
-}
-
-function buildStructureOverview(rootContents: RepoRootEntry[]): string[] {
-  const names = rootContents.map((entry) => entry.name).sort((a, b) => a.localeCompare(b));
-  return names.slice(0, 15);
-}
-
-function detectSetupSignals(rootContents: RepoRootEntry[], readme: string | null): string[] {
-  const names = new Set(rootContents.map((entry) => entry.name.toLowerCase()));
-  const signals: string[] = [];
-
-  if (readme && readme.length > 300) signals.push("README has meaningful setup/documentation content");
-  if (names.has("dockerfile")) signals.push("Docker setup present");
-  if (names.has("docker-compose.yml") || names.has("docker-compose.yaml")) signals.push("docker-compose present");
-  if (names.has("makefile")) signals.push("Makefile present");
-  if (names.has(".env.example")) signals.push(".env.example present");
-  if ([...names].some((name) => name.startsWith(".github"))) signals.push("CI/workflow config present");
-
-  return signals;
-}
-
-async function loadScoutSelectionContext(
-  repoFullName: string
-): Promise<ScoutSelectionContext | null> {
-  try {
-    const content = await readFile("reports/REPO_SCOUT_RESULTS.md", "utf8");
-    const lines = content.split("\n");
-
-    for (const line of lines) {
-      if (!line.startsWith("|")) continue;
-      if (line.includes("Repo | Score | Best For")) continue;
-      if (line.includes("---")) continue;
-
-      const columns = line
-        .split("|")
-        .slice(1, -1)
-        .map((part) => part.trim());
-
-      if (columns.length < 8) continue;
-      if (columns[0] !== repoFullName) continue;
-
-      const score = Number(columns[1]);
-      return {
-        whyRecommended: columns[3],
-        score: Number.isNaN(score) ? null : score,
-      };
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function writeAnalysisReport(context: RepoContext): Promise<void> {
-  await mkdir("reports", { recursive: true });
-  const scoutContext = await loadScoutSelectionContext(context.repoData.fullName);
-
-  const languageLines = Object.entries(context.languages)
-    .sort((a, b) => b[1] - a[1])
-    .map(([name, bytes]) => `- ${name}: ${bytes.toLocaleString()}`)
-    .join("\n");
-  const stackSignals = detectStackSignals(context.rootContents, context.readme);
-  const structureOverview = buildStructureOverview(context.rootContents);
-  const setupSignals = detectSetupSignals(context.rootContents, context.readme);
-  const readmeSnippet = context.readme
-    ? context.readme
-        .replace(/\r/g, "")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .slice(0, 6)
-        .join(" ")
-        .slice(0, 500)
-    : null;
-  const latestReleaseLine = context.latestRelease
-    ? `- Latest Release: ${context.latestRelease.tagName} (${context.latestRelease.publishedAt.toISOString()})`
-    : "- Latest Release: none detected";
-  const riskDetails = buildRiskDetails(context);
-  const repoUrl = buildRepoUrl(context.repoData.fullName);
-  const analysisHeadline = scoutContext
-    ? `${context.repoData.fullName} was shortlisted because the scout identified it as a strong candidate for this request, with particular emphasis on: ${scoutContext.whyRecommended}.`
-    : `${context.repoData.fullName} was analyzed as a candidate repository based on its GitHub metadata, structure signals, and README content.`;
-  const firstImpression = [
-    context.repoData.description ?? null,
-    stackSignals.length > 0 ? `Likely stack: ${stackSignals.join(", ")}.` : null,
-    setupSignals.length > 0 ? `Setup quality signals: ${setupSignals.slice(0, 3).join(", ")}.` : null,
-    context.latestRelease ? `A GitHub release exists (${context.latestRelease.tagName}), which is a useful maturity signal.` : "No GitHub release was detected from the current snapshot.",
-  ]
-    .filter(Boolean)
-    .join(" ");
-  const selectionReasons = scoutContext
-    ? [
-        `- Scout score: ${scoutContext.score !== null ? `${scoutContext.score}/10` : "not available"}`,
-        `- Scout rationale: ${scoutContext.whyRecommended}`,
-        `- Current repo description: ${context.repoData.description ?? "No description provided"}`,
-        `- README support: ${readmeSnippet ?? "README unavailable"}`,
-      ].join("\n")
-    : null;
-
-  const selectedSection = scoutContext
-    ? [
-        "## Why This Repo Was Selected",
-        "",
-        selectionReasons,
-        "",
-      ]
-        .filter(Boolean)
-        .join("\n")
-    : "";
-
-  const concernsSection =
-    scoutContext && scoutContext.score !== null && scoutContext.score < 7
-      ? [
-          "## Scout Concerns",
-          "",
-          `The scout scored this repo ${scoutContext.score}/10, so review it with extra attention to the trade-offs implied by: ${scoutContext.whyRecommended}.`,
-          "",
-        ].join("\n")
-      : "";
-
-  const focusSection = scoutContext
-    ? [
-        "## Analysis Focus",
-        "",
-        `This analysis emphasizes the areas highlighted by the scout: ${scoutContext.whyRecommended}.`,
-        "",
-      ].join("\n")
-    : "";
-
-  const content = [
-    "# Repo Analysis",
-    "",
-    `Generated: ${new Date().toISOString()}`,
-    "",
-    "## Analysis Summary",
-    "",
-    analysisHeadline,
-    "",
-    "## First Impression",
-    "",
-    firstImpression,
-    "",
-    selectedSection,
-    concernsSection,
-    focusSection,
-    "## Project Summary",
-    "",
-    `${context.repoData.fullName} is a ${context.repo.language ?? "software"} repository with ${context.metrics.stars.toLocaleString()} stars and ${context.contributors.toLocaleString()} contributors.`,
-    context.repoData.description ?? "No description provided.",
-    "",
-    "## Tech Stack Signals",
-    "",
-    ...(stackSignals.length > 0 ? stackSignals.map((signal) => `- ${signal}`) : ["- No strong stack signal detected from root files"]),
-    "",
-    "## Structure Overview",
-    "",
-    ...(structureOverview.length > 0 ? structureOverview.map((entry) => `- ${entry}`) : ["- Root contents unavailable"]),
-    "",
-    "## Setup Quality Signals",
-    "",
-    ...(setupSignals.length > 0 ? setupSignals.map((signal) => `- ${signal}`) : ["- No obvious setup-quality signals detected"]),
-    "",
-    "## Risks",
-    "",
-    ...(riskDetails.length > 0 ? riskDetails.map((risk) => `- ${risk}`) : ["- No major structural or maintenance risk stood out from the current snapshot."]),
-    "",
-    "## README Snapshot",
-    "",
-    readmeSnippet ?? "README unavailable.",
-    "",
-    "## Repository Metadata",
-    "",
-    `- Repo: ${context.repoData.fullName}`,
-    `- GitHub URL: ${repoUrl}`,
-    `- Default Branch: ${context.repoData.defaultBranch}`,
-    `- Created At: ${context.repoData.createdAt.toISOString()}`,
-    `- Last Push: ${context.repoData.pushedAt.toISOString()}`,
-    `- Forks: ${context.repoData.forks.toLocaleString()}`,
-    latestReleaseLine,
-    "",
-    "## Metrics Snapshot",
-    "",
-    `- Stars: ${context.metrics.stars.toLocaleString()}`,
-    `- 24h Growth: ${context.metrics.starGrowth24h}`,
-    `- Open Issues: ${context.verifiedOpenIssues.toLocaleString()}`,
-    `- Contributors: ${context.contributors.toLocaleString()}`,
-    `- Last Commit: ${context.metrics.lastCommit.toISOString()}`,
-    "",
-    "## Language Breakdown",
-    "",
-    languageLines || "- No language data available",
-    "",
-  ].join("\n");
-
-  await writeFile("reports/REPO_ANALYSIS.md", content, "utf8");
 }
 
 class AiBrain {
@@ -1006,6 +695,8 @@ async function main() {
   const prismaAdapter = new PrismaAdapter(prisma);
   const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter);
   const sessionStore = new FileSessionStore();
+  const reportWriter = new MarkdownReportWriter();
+  const analyzeRepoDeep = new AnalyzeRepoDeep(githubAdapter, analyzeRepo, reportWriter);
   const brain = new AiBrain();
   const rl = createInterface({ input, output });
   const persistedSession = await sessionStore.load();
@@ -1181,7 +872,7 @@ async function main() {
       seenRepos.push(...shortlistEntries);
       shortlistHistory.push({ prompt: userInput, repos: shortlistEntries });
       await sessionStore.save({ seenRepos, shortlistHistory });
-      await writeScoutReport(shortlist, response);
+      await writeScoutReport(reportWriter, shortlist, response);
       output.write(`${renderShortlist(shortlist)}\n`);
 
       shortlist: while (true) {
@@ -1301,8 +992,7 @@ async function main() {
         }
 
         output.write(`Running in-depth analysis for ${chosen.fullName}...\n`);
-        const repoContext = await buildRepoContext(githubAdapter, analyzeRepo, chosen);
-        await writeAnalysisReport(repoContext);
+        await analyzeRepoDeep.execute(chosen);
         output.write("Report saved to ./reports/REPO_ANALYSIS.md\n");
 
         while (true) {
