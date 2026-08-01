@@ -125,9 +125,22 @@ export async function runStagedSearch(
   const scoreAndRank = new ScoreAndRank(repoIntelligencePort);
   const { promptFitPassedCount, ranked } = await scoreAndRank.execute(qualityPassed, classification, intent);
 
+  // Confidence describes how trustworthy the ranking is as a whole — it is
+  // not a per-repo quality signal — so it's computed once, from the actual
+  // top-two gap in the full ranked list, and applied to every returned
+  // result. (Previously this ran once per row with `arr[1]` from the
+  // already-trimmed slice: correct for rank 0 in best_shortlist mode, but
+  // in best_match mode `arr` only ever had one element, so even rank 0 fell
+  // through to a hardcoded gap; every row past rank 0 always did, since
+  // `index === 0` was false. That hardcoded 0.1 clears the "High" gap
+  // threshold, so ranks 2+ read High regardless of how close the scores
+  // actually were, while rank 0 in best_match mode could read Low despite
+  // a real, wide gap. See KNOWN_ISSUES.md.)
+  const topGap = ranked[1] ? ranked[0].finalScore - ranked[1].finalScore : 0.1;
+  const searchConfidence = confidenceLabel({ stage3PromptFit: promptFitPassedCount }, topGap);
+
   const returnedCount = classification.intentMode === "best_match" ? 1 : options.top;
   const results = ranked.slice(0, returnedCount).map((result, index, arr) => {
-    const gap = index === 0 && arr[1] ? result.finalScore - arr[1].finalScore : 0.1;
     const closeAlternatives = index === 0
       ? arr
           .slice(1, 4)
@@ -137,7 +150,7 @@ export async function runStagedSearch(
 
     return {
       ...result,
-      confidence: confidenceLabel({ stage3PromptFit: promptFitPassedCount }, gap),
+      confidence: searchConfidence,
       alternativesNote:
         index === 0 && closeAlternatives.length > 0
           ? `Alternatives worth knowing: ${closeAlternatives.join("; ")}`
