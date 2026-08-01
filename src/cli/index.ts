@@ -6,6 +6,7 @@ import { PrismaAdapter } from "../adapters/database/PrismaAdapter.js";
 import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import { SearchCommand } from "./SearchCommand.js";
 import { QueryTranslator } from "../ai/QueryTranslator.js";
+import { OpenAiAdapter } from "../adapters/llm/OpenAiAdapter.js";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -48,10 +49,11 @@ async function main() {
       const githubAdapter = new GithubAdapter(requireEnv("GITHUB_TOKEN"));
       const prismaAdapter = new PrismaAdapter(prisma);
       const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter);
-      const translator = new QueryTranslator(
-        requireEnv("OPENAI_API_KEY"),
-        process.env.OPENAI_MODEL
-      );
+      const llmPort = new OpenAiAdapter({
+        openaiApiKey: requireEnv("OPENAI_API_KEY"),
+        openaiModel: process.env.OPENAI_MODEL ?? "gpt-3.5-turbo",
+      });
+      const translator = new QueryTranslator(llmPort);
       const command = new SearchCommand(githubAdapter, analyzeRepo, prismaAdapter, translator);
 
       try {

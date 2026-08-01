@@ -4,12 +4,12 @@ import { execSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import chalk from "chalk";
-import OpenAI from "openai";
 import { PrismaClient } from "@prisma/client";
 import { GithubAdapter } from "../adapters/github/GithubAdapter.js";
 import { PrismaAdapter } from "../adapters/database/PrismaAdapter.js";
 import { FileSessionStore } from "../adapters/session/FileSessionStore.js";
 import { MarkdownReportWriter } from "../adapters/reports/MarkdownReportWriter.js";
+import { OpenAiAdapter } from "../adapters/llm/OpenAiAdapter.js";
 import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
 import { AnalyzeRepoDeep } from "../domain/usecases/AnalyzeRepoDeep.js";
 import type { Metrics } from "../domain/entities/Metrics.js";
@@ -17,6 +17,7 @@ import type { SearchResult } from "../domain/entities/SearchResult.js";
 import type { SeenRepoEntry, ShortlistHistoryEntry } from "../domain/entities/SessionState.js";
 import type { RepoReleaseInfo, RepoRootEntry } from "../ports/RepoApiPort.js";
 import type { ReportWriterPort } from "../ports/ReportWriterPort.js";
+import type { LlmPort } from "../ports/LlmPort.js";
 import {
   buildRetrievalQueries,
   buildClarificationPrompt,
@@ -475,18 +476,7 @@ async function promptAfterAnalysis(
 }
 
 class AiBrain {
-  private readonly openaiClient: OpenAI | null;
-  private readonly openaiModel: string;
-  private readonly claudeKey: string | null;
-  private readonly claudeModel: string;
-
-  constructor() {
-    const openaiKey = process.env.OPENAI_API_KEY ?? null;
-    this.openaiClient = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null;
-    this.openaiModel = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
-    this.claudeKey = process.env.CLAUDE_API_KEY ?? null;
-    this.claudeModel = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-20250514";
-  }
+  constructor(private readonly llmPort: LlmPort) {}
 
   async plan(history: Turn[], userInput: string): Promise<SearchPlan> {
     const historyText = history
@@ -514,7 +504,7 @@ class AiBrain {
     ].join("\n");
 
     try {
-      const raw = await this.generateText(prompt);
+      const raw = await this.llmPort.generateText(prompt);
       return this.parsePlan(raw, userInput);
     } catch (_err) {
       return {
@@ -561,7 +551,7 @@ class AiBrain {
     ].join("\n");
 
     try {
-      return await this.generateText(prompt);
+      return await this.llmPort.generateText(prompt);
     } catch (_err) {
       if (results.length === 0) {
         return "I did not find a strong match for that query. Do you want to narrow by framework, stars, or recency?";
@@ -596,7 +586,7 @@ class AiBrain {
     ].join("\n");
 
     try {
-      const raw = await this.generateText(prompt);
+      const raw = await this.llmPort.generateText(prompt);
       const start = raw.indexOf("[");
       const end = raw.lastIndexOf("]");
       if (start === -1 || end === -1) throw new Error("No JSON array found");
@@ -607,52 +597,6 @@ class AiBrain {
     } catch {
       return [];
     }
-  }
-
-  private async generateText(prompt: string): Promise<string> {
-    if (this.claudeKey) {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": this.claudeKey,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model: this.claudeModel,
-          max_tokens: 800,
-          messages: [{ role: "user", content: prompt }],
-        }),
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Claude request failed: ${response.status} ${text}`);
-      }
-
-      const data = (await response.json()) as {
-        content?: Array<{ type: string; text?: string }>;
-      };
-      const text = data.content?.find((item) => item.type === "text")?.text?.trim();
-      if (!text) {
-        throw new Error("Claude response did not include text content");
-      }
-      return text;
-    }
-
-    if (this.openaiClient) {
-      const response = await this.openaiClient.responses.create({
-        model: this.openaiModel,
-        input: prompt,
-      });
-      const text = response.output_text?.trim();
-      if (!text) {
-        throw new Error("OpenAI response did not include text output");
-      }
-      return text;
-    }
-
-    throw new Error("Missing CLAUDE_API_KEY or OPENAI_API_KEY");
   }
 
   private parsePlan(raw: string, userInput: string): SearchPlan {
@@ -697,7 +641,13 @@ async function main() {
   const sessionStore = new FileSessionStore();
   const reportWriter = new MarkdownReportWriter();
   const analyzeRepoDeep = new AnalyzeRepoDeep(githubAdapter, analyzeRepo, reportWriter);
-  const brain = new AiBrain();
+  const llmPort = new OpenAiAdapter({
+    openaiApiKey: process.env.OPENAI_API_KEY ?? null,
+    openaiModel: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+    claudeApiKey: process.env.CLAUDE_API_KEY ?? null,
+    claudeModel: process.env.CLAUDE_MODEL ?? "claude-sonnet-4-20250514",
+  });
+  const brain = new AiBrain(llmPort);
   const rl = createInterface({ input, output });
   const persistedSession = await sessionStore.load();
   const history: Turn[] = [];
