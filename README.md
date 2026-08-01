@@ -231,8 +231,7 @@ See `ARCHITECTURE.md` for the full picture, including an honest list of known ga
 See `ARCHITECTURE.md` for the dependency-ordered version and `KNOWN_ISSUES.md` for tracked gaps.
 
 **Next**
-- Snapshot ingestion job — currently `RepoSnapshot` only grows when someone runs a search, which blocks trustworthy trend detection
-- Wire `AnalyzeRepo`/`GetTrending` to `RepoIntelligencePort` so API/MCP usage also contributes history
+- Snapshot ingestion job — currently `RepoSnapshot` only grows when someone runs a search or analyzes a repo, which blocks trustworthy trend detection. Needs a design pass (what to track, what cadence) before building.
 
 **Once real snapshot history exists**
 - Decay detection from actual deltas rather than single-point heuristics

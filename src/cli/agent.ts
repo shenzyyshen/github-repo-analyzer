@@ -22,6 +22,7 @@ import {
   buildRetrievalQueries,
   buildClarificationPrompt,
   createSessionPreferences,
+  generateClarifyingQuestions as ruleBasedClarifyingQuestions,
   inferFilters,
   normalizeSearchQuery,
   type ClarifyingQuestion,
@@ -567,6 +568,7 @@ class AiBrain {
   }
 
   async generateClarifyingQuestions(
+    intent: ParsedIntent,
     userInput: string,
     prefs: SessionPreferences
   ): Promise<ClarifyingQuestion[]> {
@@ -595,7 +597,13 @@ class AiBrain {
         .filter((q) => q.key && q.text && !prefs.skipped.has(q.key))
         .slice(0, 4);
     } catch {
-      return [];
+      // LLM unavailable or returned junk — fall back to the rule-based
+      // generator instead of asking nothing. Every other LLM call site in
+      // this file degrades to a non-AI fallback on failure (plan(),
+      // QueryTranslator.translate()); this one silently returned [] until
+      // now, which meant a flaky LLM call skipped clarification entirely
+      // rather than degrading it.
+      return ruleBasedClarifyingQuestions(intent, userInput, prefs);
     }
   }
 
@@ -637,7 +645,7 @@ async function main() {
   const prisma = new PrismaClient();
   const githubAdapter = new GithubAdapter(requireEnv("GITHUB_TOKEN"));
   const prismaAdapter = new PrismaAdapter(prisma);
-  const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter);
+  const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter, prismaAdapter);
   const sessionStore = new FileSessionStore();
   const reportWriter = new MarkdownReportWriter();
   const analyzeRepoDeep = new AnalyzeRepoDeep(githubAdapter, analyzeRepo, reportWriter);
@@ -703,7 +711,7 @@ async function main() {
       const { intent } = inferred;
 
       // Ask clarifying questions — LLM generates questions specific to this query
-      const questions = await brain.generateClarifyingQuestions(userInput, sessionPrefs);
+      const questions = await brain.generateClarifyingQuestions(intent, userInput, sessionPrefs);
       if (questions.length > 0) {
         output.write(chalk.cyan.bold("\nA few questions to sharpen the search:\n\n"));
         for (let qi = 0; qi < questions.length; qi++) {

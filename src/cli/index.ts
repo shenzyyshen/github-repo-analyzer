@@ -48,7 +48,7 @@ async function main() {
       const prisma = new PrismaClient();
       const githubAdapter = new GithubAdapter(requireEnv("GITHUB_TOKEN"));
       const prismaAdapter = new PrismaAdapter(prisma);
-      const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter);
+      const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter, prismaAdapter);
       const llmPort = new OpenAiAdapter({
         openaiApiKey: requireEnv("OPENAI_API_KEY"),
         openaiModel: process.env.OPENAI_MODEL ?? "gpt-3.5-turbo",

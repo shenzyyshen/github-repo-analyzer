@@ -23,7 +23,7 @@ async function main() {
   const githubAdapter = new GithubAdapter(requireEnv("GITHUB_TOKEN"));
   const prismaAdapter = new PrismaAdapter(prisma);
 
-  const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter);
+  const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter, prismaAdapter);
   const getTrending = new GetTrending(prismaAdapter);
 
   if (startHttp) {

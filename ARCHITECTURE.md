@@ -120,7 +120,8 @@ All thresholds and weights live in `src/config/thresholds.ts`, not inline in log
 | Table | Status |
 |---|---|
 | `Repo`, `Metrics` | Active — read/written by `PrismaAdapter` |
-| `RepoSnapshot`, `RepoHealthScore` | Active — written on every ranked search via `RepoIntelligencePort` |
+| `RepoSnapshot` | Active — written via `RepoIntelligencePort` on every ranked search (`ScoreAndRank`) and every single-repo lookup (`AnalyzeRepo`, so CLI/REST/MCP all contribute) |
+| `RepoHealthScore` | Active — written only by `ScoreAndRank`; `AnalyzeRepo` doesn't fetch the README/root-contents/owner-tier inputs a health score needs |
 | `OwnerProfile`, `DependencyMap`, `WatchTarget`, `WatchSubscription`, `NotificationEvent`, `SearchHistory`, `TrendSnapshot` | **Migrated but unwired.** No code reads or writes them yet. |
 
 ---
@@ -147,7 +148,6 @@ Honest list. Fuller detail in `KNOWN_ISSUES.md`.
 - **No snapshot ingestion job.** `RepoSnapshot` rows accumulate only when someone runs a search, so history is sparse and usage-biased. `action-plan-v2.md` calls for a standing ingestion job; it doesn't exist.
 - **Decay and dependency health are single-point heuristics.** They compute from current state, not historical deltas, despite `RepoSnapshot`/`DependencyMap` existing to support exactly that. `action-plan-v2.md` Phase 8 says not to build decay logic before snapshot cycles have run — it was built first. The labels are directionally useful but not yet backed by trend data.
 - **The discovery pipeline has no REST surface.** It's reachable from CLI and MCP; Express still only exposes `AnalyzeRepo`/`GetTrending`.
-- **`AnalyzeRepo`/`GetTrending` don't write to `RepoIntelligencePort`,** so API/MCP usage contributes no snapshot history.
 - **Spikes A/B/C** (README-scoring calibration, dependency data source, intent-classification accuracy) — `action-plan-v2.md` prerequisites — were never run as structured exercises.
 - **`--trends` flag** (Phase 11) doesn't exist. `--explain` does.
 
@@ -158,8 +158,7 @@ Honest list. Fuller detail in `KNOWN_ISSUES.md`.
 Ordered by dependency, following `action-plan-v2.md`'s unlock map.
 
 **Next**
-- Snapshot ingestion job — unblocks everything trend-related
-- Wire `AnalyzeRepo`/`GetTrending` to `RepoIntelligencePort`
+- Snapshot ingestion job — unblocks everything trend-related. Needs a design decision (what to track, what cadence, where a scheduler runs in a CLI-first tool) before building.
 
 **After real snapshot history exists (weeks, not days)**
 - Genuine decay detection from deltas (Phase 8)
