@@ -15,6 +15,12 @@ Bugs and gaps found during work on this codebase, logged rather than fixed inlin
 - **`--trends` flag** — documented as a goal in `action-plan-v2.md` Phase 11, does not exist in `src/cli/index.ts`. `--explain` does exist and works.
 - **Spikes A/B/C** (`action-plan-v2.md`, prerequisites for Phase 1) — README-quality-scoring calibration, dependency-data-source validation, and intent-classification-accuracy testing were never formally run as the structured exercises the plan describes. `reports/SEARCH_CRITERIA_REVIEW_2026-03-30.md` and `reports/SEARCH_AND_NOTIFICATIONS_BRAINSTORM_2026-04-01.md` cover adjacent ground informally but aren't a substitute.
 
+## Correctness
+
+- **Per-row confidence labels are inverted (`src/domain/usecases/SearchRepos.ts:130`)** — `const gap = index === 0 && arr[1] ? result.finalScore - arr[1].finalScore : 0.1;` computes a real score gap only for rank 1; every other row gets a hardcoded `0.1`, which exceeds `CONFIDENCE_THRESHOLDS.high.minGap` (0.08). Result: ranks 2+ are handed "High" confidence unconditionally whenever the stage-3 pool is large enough, while rank 1 is the only honestly-evaluated row. Observed live on 2026-08-01 via MCP `search_repos` for "self-hosted uptime monitoring dashboard": rank 1 `apache/hertzbeat` = **Low**, ranks 2–3 = **High**.
+
+  Root cause is conceptual, not a typo: `action-plan-v2.md` defines confidence as a property of the *result set* ("Rank 1 score > 80 AND gap to rank 2 > 10 points → High"), but the code applies it per row. The fix is to compute one confidence label for the search and attach it to the result set, not to each entry — which is a behavior change, so it was left for a deliberate pass rather than folded into a refactor commit. Now higher priority than before, because the MCP surface feeds this label to a model that will act on it.
+
 ## Structure
 
 - **`classifyIntent` / `inferArtifactType` (`src/cli/stagedSearch.ts`)** — Stage 0 classification logic still living in a CLI file rather than alongside `ParseIntent` in the domain. Never explicitly scoped into the hexagon-refactor plan, so it was left in place rather than folded in silently. Everything else it touches is already extracted, so this is a small, self-contained follow-up.

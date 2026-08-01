@@ -35,7 +35,7 @@ async function main() {
   }
 
   if (startMcp) {
-    const mcpServer = createMcpServer(analyzeRepo, getTrending);
+    const mcpServer = createMcpServer(analyzeRepo, getTrending, githubAdapter, prismaAdapter);
     await connectMcpServer(mcpServer);
     console.log("MCP server connected over stdio");
   }

@@ -113,10 +113,10 @@ This repo contains two related systems at different levels of maturity. Worth kn
 | | Discovery pipeline | Single-repo lookup |
 |---|---|---|
 | **What** | Natural-language search → retrieval → gates → scoring → ranked shortlist | Analyze one repo's metrics; list trending repos |
-| **Surfaces** | CLI only (`npm run repo`, `npm run cli -- search`) | CLI + REST + MCP |
-| **Use cases** | `ParseIntent`, `DiscoverRepos`, `ApplyQualityGates`, `ScoreAndRank`, `AnalyzeRepoDeep` | `AnalyzeRepo`, `GetTrending` |
+| **Surfaces** | CLI + MCP (`npm run repo`, `npm run cli -- search`, `search_repos` tool) | CLI + REST + MCP |
+| **Use cases** | `SearchRepos` (composing `ParseIntent`, `DiscoverRepos`, `ApplyQualityGates`, `ScoreAndRank`), plus `AnalyzeRepoDeep` | `AnalyzeRepo`, `GetTrending` |
 
-The single-repo use cases run unmodified across all three transports via constructor injection in `src/index.ts`. The discovery pipeline has no HTTP or MCP surface yet.
+Both run unmodified across their transports via constructor injection in `src/index.ts` — the CLI adds terminal rendering, MCP adds JSON payload shaping, neither touches the pipeline itself. The discovery pipeline has no HTTP surface yet.
 
 ---
 
@@ -131,9 +131,30 @@ Single-repo analysis and trending over HTTP. Stable, intended for a future GUI:
 ---
 
 ## MCP Tools
-The same two use cases exposed to MCP-compatible AI clients over stdio:
-- `analyze_repo(owner, repo, deep?)`
-- `get_trending(language?)`
+Exposed to MCP-compatible AI clients (Claude Desktop, etc.) over stdio:
+
+- **`search_repos(query, language?, minStars?, since?, mode?, top?)`** — the full discovery pipeline. Give it a plain-English need and it returns a ranked shortlist where each entry carries health score, decay label, owner tier, dependency health, and a one-line rationale for its placement. This is the same `SearchRepos` use case the CLI runs.
+- `analyze_repo(owner, repo, deep?)` — metrics for one named repo
+- `get_trending(language?)` — locally-cached repos by recent star growth
+
+Wire it into Claude Desktop via `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "github-repo-analyzer": {
+      "command": "node",
+      "args": ["/absolute/path/to/repo-metrics-hex/dist/index.js", "--mcp"],
+      "env": {
+        "GITHUB_TOKEN": "ghp_...",
+        "DATABASE_URL": "postgresql://..."
+      }
+    }
+  }
+}
+```
+
+Run `npm run build` first so `dist/` exists.
 
 ---
 

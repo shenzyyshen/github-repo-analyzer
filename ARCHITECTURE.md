@@ -12,9 +12,11 @@ The product is a **terminal-first GitHub repo scout** that turns a natural-langu
 
 This repo contains two related but distinct systems. Conflating them leads to overclaiming, so they're separated here.
 
-**1. The staged discovery pipeline (CLI-only).** Natural-language search → multi-query retrieval → quality gates → prompt-fit scoring → composite ranking → shortlist. Fully extracted into domain use cases. Reachable via `npm run repo` (conversational agent) and `npm run cli -- search` (direct command). **It has no REST or MCP surface.**
+**1. The staged discovery pipeline (CLI + MCP).** Natural-language search → multi-query retrieval → quality gates → prompt-fit scoring → composite ranking → shortlist. Lives in `SearchRepos` (domain). Reachable via `npm run repo` (conversational agent), `npm run cli -- search` (direct command), and the `search_repos` MCP tool. The same domain use case backs all three — the CLI adds chalk rendering, MCP adds JSON payload shaping, neither touches the pipeline. **No REST surface yet.**
 
-**2. Single-repo lookup (REST + MCP + CLI).** `AnalyzeRepo` and `GetTrending` — fetch one repo's metrics, or list trending repos. These run unmodified across three delivery surfaces via constructor injection in `src/index.ts`. This is the part where "same core logic, multiple transports" is literally true.
+**2. Single-repo lookup (CLI + REST + MCP).** `AnalyzeRepo` and `GetTrending` — fetch one repo's metrics, or list trending repos. Injected into all three transports in `src/index.ts`.
+
+Both subsystems demonstrate the same property: a use case runs unmodified across delivery mechanisms, because each transport is a driving adapter that calls the domain rather than containing it.
 
 ---
 
@@ -29,6 +31,7 @@ The business core. Zero imports from adapters, Express, Prisma, Octokit, OpenAI,
 | Use case | Stage | Responsibility |
 |---|---|---|
 | `ParseIntent` | 0 | Prompt string → `ParsedIntent` (language, license, activity, maturity signals, domain concepts, retrieval-query variants). Pure logic, no ports. |
+| `SearchRepos` | 0–5 | Composes the whole pipeline: classifies intent, then runs discovery → gates → scoring, trims to N, attaches confidence and alternatives. The entry point every discovery surface calls. |
 | `DiscoverRepos` | 1 | Multi-query retrieval, merge/dedup (200-candidate cap), preselection, enrichment (README/root-contents/release/metrics). |
 | `ApplyQualityGates` | 2 | Drops archived, forks, missing/thin READMEs, weak prompt overlap, stale-for-domain, below-star-floor. |
 | `ScoreAndRank` | 3–4 | Prompt-fit scoring, health score, freshness, decay, dependency health, domain-speed-weighted composite ranking. Persists snapshot + health-score rows. |
@@ -71,9 +74,9 @@ Interfaces only, no implementation.
 - `src/cli/agent.ts` — conversational terminal agent (composition root + readline + rendering)
 - `src/cli/index.ts` + `SearchCommand.ts` — direct CLI search command
 - `src/server/express.ts` — HTTP API
-- `src/server/mcp.ts` — MCP tools over stdio
+- `src/server/mcp.ts` — MCP tools over stdio (`search_repos`, `analyze_repo`, `get_trending`)
 
-`src/cli/stagedSearch.ts` composes the pipeline stages and renders CLI output; it is not itself domain logic.
+`src/cli/stagedSearch.ts` is CLI presentation only (`renderStagedSearch`), re-exporting the domain pipeline for existing call sites.
 
 ---
 
@@ -142,8 +145,8 @@ Honest list. Fuller detail in `KNOWN_ISSUES.md`.
 
 - **No snapshot ingestion job.** `RepoSnapshot` rows accumulate only when someone runs a search, so history is sparse and usage-biased. `action-plan-v2.md` calls for a standing ingestion job; it doesn't exist.
 - **Decay and dependency health are single-point heuristics.** They compute from current state, not historical deltas, despite `RepoSnapshot`/`DependencyMap` existing to support exactly that. `action-plan-v2.md` Phase 8 says not to build decay logic before snapshot cycles have run — it was built first. The labels are directionally useful but not yet backed by trend data.
-- **`classifyIntent` / `inferArtifactType` still live in `src/cli/stagedSearch.ts`.** They're Stage 0 logic sitting in a CLI file; they belong with `ParseIntent`.
-- **The discovery pipeline has no REST/MCP surface.** Only `AnalyzeRepo`/`GetTrending` are exposed there.
+- **Per-row confidence labels are inverted.** Only rank 1 gets a real score-gap computation; ranks 2+ receive a hardcoded gap that clears the "High" threshold automatically, so the best result can read `Low` while weaker ones read `High`. Confidence should be one label for the result set, not per row. Detail and a live reproduction in `KNOWN_ISSUES.md`.
+- **The discovery pipeline has no REST surface.** It's reachable from CLI and MCP; Express still only exposes `AnalyzeRepo`/`GetTrending`.
 - **`AnalyzeRepo`/`GetTrending` don't write to `RepoIntelligencePort`,** so API/MCP usage contributes no snapshot history.
 - **Spikes A/B/C** (README-scoring calibration, dependency data source, intent-classification accuracy) — `action-plan-v2.md` prerequisites — were never run as structured exercises.
 - **`--trends` flag** (Phase 11) doesn't exist. `--explain` does.
@@ -155,7 +158,7 @@ Honest list. Fuller detail in `KNOWN_ISSUES.md`.
 Ordered by dependency, following `action-plan-v2.md`'s unlock map.
 
 **Next**
-- Move `classifyIntent`/`inferArtifactType` into `ParseIntent`
+- Fix per-row confidence (compute once for the result set) — now user-visible over MCP
 - Snapshot ingestion job — unblocks everything trend-related
 - Wire `AnalyzeRepo`/`GetTrending` to `RepoIntelligencePort`
 
