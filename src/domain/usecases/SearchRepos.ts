@@ -139,24 +139,28 @@ export async function runStagedSearch(
   const topGap = ranked[1] ? ranked[0].finalScore - ranked[1].finalScore : 0.1;
   const searchConfidence = confidenceLabel({ stage3PromptFit: promptFitPassedCount }, topGap);
 
-  const returnedCount = classification.intentMode === "best_match" ? 1 : options.top;
-  const results = ranked.slice(0, returnedCount).map((result, index, arr) => {
-    const closeAlternatives = index === 0
-      ? arr
-          .slice(1, 4)
-          .filter((candidate) => Math.abs(candidate.healthScore - result.healthScore) <= 15)
-          .map((candidate) => `${candidate.repo.fullName} (${candidate.artifactType}, health ${candidate.healthScore})`)
-      : [];
+  // Same "compare against the real pool, not whatever got trimmed for
+  // display" fix as confidence above. Previously this compared the top
+  // result against `arr.slice(1, 4)` of the already-trimmed results array,
+  // so in best_match mode (returnedCount 1) there was never anything past
+  // index 0 to compare against — alternativesNote was always null even
+  // when a close rank-2 candidate existed in the full ranked pool.
+  const topResult = ranked[0];
+  const closeAlternatives = topResult
+    ? ranked
+        .slice(1, 4)
+        .filter((candidate) => Math.abs(candidate.healthScore - topResult.healthScore) <= 15)
+        .map((candidate) => `${candidate.repo.fullName} (${candidate.artifactType}, health ${candidate.healthScore})`)
+    : [];
+  const topAlternativesNote =
+    closeAlternatives.length > 0 ? `Alternatives worth knowing: ${closeAlternatives.join("; ")}` : null;
 
-    return {
-      ...result,
-      confidence: searchConfidence,
-      alternativesNote:
-        index === 0 && closeAlternatives.length > 0
-          ? `Alternatives worth knowing: ${closeAlternatives.join("; ")}`
-          : null,
-    };
-  });
+  const returnedCount = classification.intentMode === "best_match" ? 1 : options.top;
+  const results = ranked.slice(0, returnedCount).map((result, index) => ({
+    ...result,
+    confidence: searchConfidence,
+    alternativesNote: index === 0 ? topAlternativesNote : null,
+  }));
 
   return {
     query: originalQuery,

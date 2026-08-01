@@ -129,3 +129,49 @@ describe("runStagedSearch confidence", () => {
     expect(["Low", "Medium", "High"]).toContain(results[0].confidence);
   });
 });
+
+describe("runStagedSearch alternativesNote", () => {
+  it("surfaces close alternatives in best_match mode instead of always null", async () => {
+    const pool = makeCandidatePool(6);
+    const { results } = await runSearch(pool, { top: 6, requestedMode: "best_match" });
+
+    expect(results).toHaveLength(1);
+    // Previously always null here: best_match trims to one result before
+    // computing alternatives, so there was never anything past index 0 in
+    // the array being compared against.
+    expect(results[0].alternativesNote).not.toBeNull();
+    expect(results[0].alternativesNote).toContain("Alternatives worth knowing");
+  });
+
+  it("gives the top result the same alternatives note whether the caller asks for one result or several", async () => {
+    const pool = makeCandidatePool(6);
+
+    const shortlist = await runSearch(pool, { top: 6, requestedMode: "best_shortlist" });
+    const bestMatch = await runSearch(pool, { top: 6, requestedMode: "best_match" });
+
+    expect(bestMatch.results[0].alternativesNote).toBe(shortlist.results[0].alternativesNote);
+  });
+
+  it("compares against the full ranked pool, not just what's returned to the caller", async () => {
+    const pool = makeCandidatePool(6);
+    // Only 2 results returned, but candidates ranked 3rd/4th overall
+    // (acme/widget-2, acme/widget-3) should still be nameable as close
+    // alternatives to rank 1 — they exist in the ranked pool even though
+    // they aren't in `results`.
+    const { results } = await runSearch(pool, { top: 2, requestedMode: "best_shortlist" });
+
+    expect(results).toHaveLength(2);
+    expect(results[0].alternativesNote).toContain("acme/widget-2");
+    expect(results[0].alternativesNote).toContain("acme/widget-3");
+  });
+
+  it("stays null for every result except the top one", async () => {
+    const pool = makeCandidatePool(6);
+    const { results } = await runSearch(pool, { top: 6, requestedMode: "best_shortlist" });
+
+    expect(results[0].alternativesNote).not.toBeNull();
+    for (const result of results.slice(1)) {
+      expect(result.alternativesNote).toBeNull();
+    }
+  });
+});
