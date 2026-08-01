@@ -146,7 +146,6 @@ Honest list. Fuller detail in `KNOWN_ISSUES.md`.
 
 - **No snapshot ingestion job.** `RepoSnapshot` rows accumulate only when someone runs a search, so history is sparse and usage-biased. `action-plan-v2.md` calls for a standing ingestion job; it doesn't exist.
 - **Decay and dependency health are single-point heuristics.** They compute from current state, not historical deltas, despite `RepoSnapshot`/`DependencyMap` existing to support exactly that. `action-plan-v2.md` Phase 8 says not to build decay logic before snapshot cycles have run — it was built first. The labels are directionally useful but not yet backed by trend data.
-- **`alternativesNote` only ever populates for `best_match` mode's rank 1, never for a shortlist.** Same "trimmed array vs. full ranked pool" shape as the confidence bug fixed 2026-08-01 — logged separately since it's a feature gap, not an inverted signal. Detail in `KNOWN_ISSUES.md`.
 - **The discovery pipeline has no REST surface.** It's reachable from CLI and MCP; Express still only exposes `AnalyzeRepo`/`GetTrending`.
 - **`AnalyzeRepo`/`GetTrending` don't write to `RepoIntelligencePort`,** so API/MCP usage contributes no snapshot history.
 - **Spikes A/B/C** (README-scoring calibration, dependency data source, intent-classification accuracy) — `action-plan-v2.md` prerequisites — were never run as structured exercises.
@@ -161,7 +160,6 @@ Ordered by dependency, following `action-plan-v2.md`'s unlock map.
 **Next**
 - Snapshot ingestion job — unblocks everything trend-related
 - Wire `AnalyzeRepo`/`GetTrending` to `RepoIntelligencePort`
-- Fix `alternativesNote`'s trimmed-array slicing (same shape as the confidence fix)
 
 **After real snapshot history exists (weeks, not days)**
 - Genuine decay detection from deltas (Phase 8)

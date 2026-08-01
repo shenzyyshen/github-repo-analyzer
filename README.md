@@ -233,7 +233,6 @@ See `ARCHITECTURE.md` for the dependency-ordered version and `KNOWN_ISSUES.md` f
 **Next**
 - Snapshot ingestion job — currently `RepoSnapshot` only grows when someone runs a search, which blocks trustworthy trend detection
 - Wire `AnalyzeRepo`/`GetTrending` to `RepoIntelligencePort` so API/MCP usage also contributes history
-- Fix `alternativesNote`'s trimmed-array slicing (same "compare against the wrong pool" shape the confidence bug had)
 
 **Once real snapshot history exists**
 - Decay detection from actual deltas rather than single-point heuristics
