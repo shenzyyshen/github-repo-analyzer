@@ -4,8 +4,9 @@ import { parseIntent } from "./ParseIntent.js";
 import type { EnrichedRepo } from "./DiscoverRepos.js";
 import type { SearchResult } from "../entities/SearchResult.js";
 import type { Metrics } from "../entities/Metrics.js";
-import type { IntentClassification } from "../entities/IntentClassification.js";
+import type { DomainSpeed, FreshnessOverride, IntentClassification } from "../entities/IntentClassification.js";
 import type { RepoIntelligencePort } from "../../ports/RepoIntelligencePort.js";
+import { RANKING_WEIGHTS } from "../../config/thresholds.js";
 
 function makeRepo(overrides: Partial<SearchResult> = {}): SearchResult {
   return {
@@ -191,5 +192,113 @@ describe("ScoreAndRank.execute", () => {
     expect(ranked).toHaveLength(1);
     expect(consoleError).toHaveBeenCalled();
     consoleError.mockRestore();
+  });
+});
+
+describe("ScoreAndRank ranking weight conservation", () => {
+  async function rankOne(domainSpeed: DomainSpeed, freshnessOverride: FreshnessOverride) {
+    const scoreAndRank = new ScoreAndRank(makeMockIntelligencePort());
+    const { ranked } = await scoreAndRank.execute(
+      [makeEnriched()],
+      { ...classification, domainSpeed, freshnessOverride },
+      intent
+    );
+    return ranked[0];
+  }
+
+  it.each([
+    ["fast", "none"], ["fast", "strict"], ["fast", "relaxed"],
+    ["slow", "none"], ["slow", "strict"], ["slow", "relaxed"],
+  ] as const)("sums to 1.0 for domainSpeed=%s freshnessOverride=%s", async (domainSpeed, freshnessOverride) => {
+    const result = await rankOne(domainSpeed, freshnessOverride);
+    const total = Object.values(result.breakdown.ranking).reduce((sum, w) => sum + w, 0);
+    expect(total).toBeCloseTo(1, 5);
+  });
+
+  it("pulls the strict-freshness boost from health, leaving stars and ownerTier untouched", async () => {
+    const base = RANKING_WEIGHTS.fast;
+    const result = await rankOne("fast", "strict");
+
+    expect(result.breakdown.ranking.stars).toBe(base.stars);
+    expect(result.breakdown.ranking.ownerTier).toBe(base.ownerTier);
+    expect(result.breakdown.ranking.freshness).toBeGreaterThan(base.freshness);
+    expect(result.breakdown.ranking.health).toBeLessThan(base.health);
+  });
+
+  it("does not change stars or ownerTier weight for relaxed freshness either", async () => {
+    const base = RANKING_WEIGHTS.slow;
+    const result = await rankOne("slow", "relaxed");
+
+    expect(result.breakdown.ranking.stars).toBe(base.stars);
+    expect(result.breakdown.ranking.ownerTier).toBe(base.ownerTier);
+  });
+});
+
+describe("ScoreAndRank whyThisRepo", () => {
+  it("states the star count as part of the reasoning, not just as a separate stat", async () => {
+    const scoreAndRank = new ScoreAndRank(makeMockIntelligencePort());
+    const { ranked } = await scoreAndRank.execute(
+      [makeEnriched({ search: makeRepo({ stars: 87_654 }) })],
+      classification,
+      intent
+    );
+
+    expect(ranked[0].whyThisRepo).toContain("Stars: 87,654");
+  });
+
+  it("flags a fresh release from an elite-tier owner", async () => {
+    const scoreAndRank = new ScoreAndRank(makeMockIntelligencePort());
+    const { ranked } = await scoreAndRank.execute(
+      [
+        makeEnriched({
+          search: makeRepo({ owner: "anthropic", stars: 60_000, pushedAt: new Date() }),
+          latestRelease: { tagName: "v1.0.0", publishedAt: new Date() },
+        }),
+      ],
+      classification,
+      intent
+    );
+
+    expect(ranked[0].ownerTier).toBe("Elite");
+    expect(ranked[0].whyThisRepo).toContain("Notable: fresh release from an established maintainer");
+  });
+
+  it("does not flag a non-elite owner even when freshly released", async () => {
+    const scoreAndRank = new ScoreAndRank(makeMockIntelligencePort());
+    const { ranked } = await scoreAndRank.execute(
+      [
+        makeEnriched({
+          search: makeRepo({ owner: "randodev", stars: 500, forks: 10, pushedAt: new Date() }),
+          latestRelease: { tagName: "v1.0.0", publishedAt: new Date() },
+        }),
+      ],
+      classification,
+      intent
+    );
+
+    expect(ranked[0].ownerTier).not.toBe("Elite");
+    expect(ranked[0].whyThisRepo).not.toContain("Notable:");
+  });
+
+  it("does not flag an elite owner whose repo is stale", async () => {
+    // Old enough to fail the "recently active" (<=30 days) check, but well
+    // inside the medium-domain decay disqualify threshold (540 days) so it
+    // survives to be ranked at all rather than being dropped as Abandoned.
+    const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const scoreAndRank = new ScoreAndRank(makeMockIntelligencePort());
+    const { ranked } = await scoreAndRank.execute(
+      [
+        makeEnriched({
+          search: makeRepo({ owner: "anthropic", stars: 60_000, pushedAt: ninetyDaysAgo }),
+          latestRelease: { tagName: "v1.0.0", publishedAt: ninetyDaysAgo },
+        }),
+      ],
+      classification,
+      intent
+    );
+
+    expect(ranked).toHaveLength(1);
+    expect(ranked[0].ownerTier).toBe("Elite");
+    expect(ranked[0].whyThisRepo).not.toContain("Notable:");
   });
 });

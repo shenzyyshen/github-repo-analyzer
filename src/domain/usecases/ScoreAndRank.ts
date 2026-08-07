@@ -307,15 +307,34 @@ function decayLabelFor(
   return "Healthy";
 }
 
+/**
+ * Moves weight from `giver` to `taker`, clamped to what `giver` actually
+ * has. Using the same clamped amount on both sides is what keeps the total
+ * at 1.0 — moving two independent flat deltas (take D from A, give D to B)
+ * silently breaks conservation whenever A has less than D to give.
+ */
+function shiftWeight(
+  base: WeightedScoreBreakdown,
+  giver: keyof WeightedScoreBreakdown,
+  taker: keyof WeightedScoreBreakdown,
+  amount: number
+): void {
+  const delta = Math.min(amount, base[giver]);
+  base[giver] -= delta;
+  base[taker] += delta;
+}
+
 function rankingWeights(classification: IntentClassification): WeightedScoreBreakdown {
   const base: WeightedScoreBreakdown = { ...(classification.domainSpeed === "fast" ? RANKING_WEIGHTS.fast : RANKING_WEIGHTS.slow) };
 
   if (classification.freshnessOverride === "strict") {
-    base.freshness += FRESHNESS_OVERRIDE_DELTA;
-    base.stars = Math.max(0, base.stars - 0.1);
+    // Freshness draws from health, never stars or ownerTier: adoption
+    // signals shouldn't lose weight just because the ask emphasized
+    // recency, and a genuinely new repo from an established maintainer
+    // shouldn't be penalized for not having had time to build reputation.
+    shiftWeight(base, "health", "freshness", FRESHNESS_OVERRIDE_DELTA);
   } else if (classification.freshnessOverride === "relaxed") {
-    base.freshness = Math.max(0, base.freshness - FRESHNESS_OVERRIDE_DELTA);
-    base.maintenance += FRESHNESS_OVERRIDE_DELTA;
+    shiftWeight(base, "freshness", "maintenance", FRESHNESS_OVERRIDE_DELTA);
   }
 
   return base;
@@ -398,6 +417,8 @@ export class ScoreAndRank {
         if (dependencyHealth !== "Clean") noteParts.push(`Dependency health: ${dependencyHealth}`);
         if (repo.analysisError) noteParts.push("Some analysis signals were unavailable");
 
+        const recentlyActive = daysSince(repo.latestRelease?.publishedAt ?? repo.search.pushedAt) <= 30;
+
         return {
           repo: repo.search,
           metrics: repo.metrics,
@@ -415,10 +436,12 @@ export class ScoreAndRank {
           finalScore,
           whyThisRepo: [
             `Match: ${fit.score >= 0.75 ? "strong direct fit" : fit.score >= 0.5 ? "credible fit" : "broader but relevant fit"}`,
-            `Freshness: ${daysSince(repo.latestRelease?.publishedAt ?? repo.search.pushedAt) <= 30 ? "recently active" : "still current for its domain"}`,
+            `Freshness: ${recentlyActive ? "recently active" : "still current for its domain"}`,
             `Owner: ${ownerTier}`,
+            `Stars: ${repo.search.stars.toLocaleString()}`,
             `Dependency health: ${dependencyHealth}`,
             `Prompt fit: ${Math.round(fit.score * 100)}%`,
+            ...(ownerTier === "Elite" && recentlyActive ? ["Notable: fresh release from an established maintainer"] : []),
           ].join(" | "),
           note: noteParts.length > 0 ? noteParts.join(" | ") : null,
           alternativesNote: null,
