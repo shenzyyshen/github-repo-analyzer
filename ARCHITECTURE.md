@@ -105,11 +105,22 @@ Stage counts at each step are surfaced in CLI output (`raw → quality → fit �
 - **Prompt fit** — name, description, README, topic matches; language match; artifact-type match
 - **Health score (0–100)** — README quality, stars velocity, dependency freshness, maintenance quality, owner tier
 - **Freshness** — push recency + release recency, weighted by domain speed
-- **Decay** — `Healthy` / `Slowing` / `Fading` / `Abandoned`
+- **Decay** — `Healthy` / `Slowing` / `Fading` / `Abandoned`, evaluated live from the repo's current state (see the shelved ingestion job note below — this is a deliberate design choice, not an interim gap)
 - **Dependency health** — `Clean` / `Minor risk` / `Supply chain risk`
-- **Owner tier** — `Elite` / `Strong` / `Promising` / `Weak`
+- **Owner tier** — `Elite` / `Strong` / `Promising` / `Weak`, backed by a known-elite-owner list (Anthropic, OpenAI, Microsoft, etc.) plus stars/forks thresholds
 
 All thresholds and weights live in `src/config/thresholds.ts`, not inline in logic.
+
+### Composite ranking
+
+The five signals above combine into one `finalScore` per candidate, weighted differently for fast-moving domains (LLM/agent/MCP-adjacent topics) versus slower-moving ones — prompt fit and health dominate either way, but a fast-moving query leans harder on freshness and lighter on maintenance history, since "actively evolving" is itself part of what's being asked for.
+
+Two guarantees hold regardless of how a request is classified:
+
+- **The weights always account for exactly the whole score** — nothing is silently over- or under-counted. When a request's freshness gets emphasized, the boost is funded from the health signal, verified by a test across every domain/emphasis combination.
+- **Stars and owner reputation are protected signals.** Emphasizing freshness never discounts either — a request for something new and exciting still wants an adopted, credible result, not freshness traded off against them. A brand-new repo from a known, credible maintainer is treated on its own merits rather than penalized for not yet having built independent reputation.
+
+When a result comes from a recognized elite-tier owner *and* was pushed within the last month, the reasoning explains that explicitly ("fresh release from an established maintainer") rather than leaving it implicit in the score — the aim is for a strong find to read as an obvious one, not just rank higher without explanation.
 
 ---
 
@@ -145,31 +156,31 @@ All thresholds and weights live in `src/config/thresholds.ts`, not inline in log
 
 Honest list. Fuller detail in `KNOWN_ISSUES.md`.
 
-- **No snapshot ingestion job.** `RepoSnapshot` rows accumulate only when someone runs a search, so history is sparse and usage-biased. `action-plan-v2.md` calls for a standing ingestion job; it doesn't exist.
-- **Decay and dependency health are single-point heuristics.** They compute from current state, not historical deltas, despite `RepoSnapshot`/`DependencyMap` existing to support exactly that. `action-plan-v2.md` Phase 8 says not to build decay logic before snapshot cycles have run — it was built first. The labels are directionally useful but not yet backed by trend data.
+- **No snapshot ingestion job — by decision, not by omission.** Considered and shelved 2026-08-05: this product is used for one-off, prompt-driven discovery, not repeated observation of a fixed portfolio, so a background poller has no stable set of repos to revisit. Decay and dependency health are evaluated live from current state instead — that's the intended design now, not a placeholder waiting on infrastructure. Detail in `KNOWN_ISSUES.md`.
+- **`action-plan-v2.md` is stale against that decision** — it still presents the ingestion job as required groundwork (Risk 1, Phase 1, Phase 8, Phase 12). Not rewritten yet; a future reader would believe it's still planned.
 - **The discovery pipeline has no REST surface.** It's reachable from CLI and MCP; Express still only exposes `AnalyzeRepo`/`GetTrending`.
-- **Spikes A/B/C** (README-scoring calibration, dependency data source, intent-classification accuracy) — `action-plan-v2.md` prerequisites — were never run as structured exercises.
-- **`--trends` flag** (Phase 11) doesn't exist. `--explain` does.
+- **Spike A (README-quality calibration)** is the one part of the shelved spike list that's now more relevant, not less — it's the direct validation of "does README comprehensiveness correctly outweigh raw stars," which the product leans on entirely now that there's no historical fallback. Spikes B and C are shelved/independent respectively — detail in `KNOWN_ISSUES.md`.
+- **`--trends` flag** doesn't exist, and won't — it depended on `TrendSnapshot`, which depended on the shelved ingestion job.
 
 ---
 
 ## Roadmap
 
-Ordered by dependency, following `action-plan-v2.md`'s unlock map.
+Ordered by dependency, following `action-plan-v2.md`'s unlock map where that map is still current.
 
 **Next**
-- Snapshot ingestion job — unblocks everything trend-related. Needs a design decision (what to track, what cadence, where a scheduler runs in a CLI-first tool) before building.
+- Run Spike A (README-quality calibration) against real search results — the product's core judgment (README comprehensiveness vs. raw stars) now runs with no historical backstop, so validating it matters more than it did when the ingestion job was still on the table
+- Decide whether/how to amend `action-plan-v2.md` itself so it stops presenting the shelved ingestion job as planned
 
-**After real snapshot history exists (weeks, not days)**
-- Genuine decay detection from deltas (Phase 8)
-- Stars-velocity scoring off real trend data
-
-**Requires a resolved data source**
-- Dependency awareness / supply-chain risk (Phase 9, needs Spike B)
-
-**Later**
-- Owner profile persistence + weekly refresh (Phase 7)
-- Search history, rerun-with-diff, trend radar, `--trends` (Phase 12)
+**Shelved along with the ingestion job (2026-08-05)** — each of these needs snapshot history accumulating on a schedule, which this product deliberately doesn't build:
+- Delta-based decay detection and stars-velocity scoring (Phase 8)
+- Trend radar and rerun-with-diff (Phase 12)
+- `--trends` flag (Phase 11)
 - Watch targets and notifications (Phase 13)
+
+**Independently open** — don't depend on the shelved job:
+- Dependency awareness / supply-chain risk (Phase 9) — needs Spike B (data source) resolved first
+- Owner profile persistence (Phase 7) — could refresh opportunistically on encounter, same pattern `RepoSnapshot` already uses, rather than needing a poller
+- Plain search history (logging past searches) — distinct from trend radar above; doesn't need deltas, just a log
 - Compare mode between shortlisted repos
 - Web UI over the same domain layer

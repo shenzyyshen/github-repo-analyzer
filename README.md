@@ -231,16 +231,14 @@ See `ARCHITECTURE.md` for the full picture, including an honest list of known ga
 See `ARCHITECTURE.md` for the dependency-ordered version and `KNOWN_ISSUES.md` for tracked gaps.
 
 **Next**
-- Snapshot ingestion job — currently `RepoSnapshot` only grows when someone runs a search or analyzes a repo, which blocks trustworthy trend detection. Needs a design pass (what to track, what cadence) before building.
+- Run the README-quality calibration spike against real search results — the ranking's core judgment call (does a better-documented, lower-star repo correctly beat a poorly-documented, higher-star one) has no historical fallback now that a standing ingestion job has been ruled out, so validating it directly matters more than it used to.
 
-**Once real snapshot history exists**
-- Decay detection from actual deltas rather than single-point heuristics
-- Stars-velocity scoring off real trend data
+**Shelved (2026-08-05)** — a background snapshot poller doesn't fit how this tool is actually used (one-off, prompt-driven discovery, not a fixed portfolio to keep re-checking), so decay/dependency signals are evaluated live by design, not as a placeholder:
+- Delta-based decay detection, stars-velocity trends, trend radar, `--trends`, watch targets and notifications
 
-**Later**
+**Independently open**
 - Dependency/supply-chain risk (needs a confirmed data source)
-- Owner profile persistence, search history, trend radar, `--trends`
-- Watch targets and notifications
+- Owner profile persistence, plain search-history logging
 - Compare mode for shortlisted repos
 - Web UI over the same domain layer
 
