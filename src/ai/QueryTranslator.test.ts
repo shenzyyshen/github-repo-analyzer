@@ -50,6 +50,20 @@ describe("QueryTranslator.translate", () => {
     });
   });
 
+  it("names the actual failure reason in the fallback warning, not a generic message", async () => {
+    const llmPort: LlmPort = {
+      generateText: vi.fn().mockRejectedValue(new Error("401 Incorrect API key provided")),
+    };
+    const translator = new QueryTranslator(llmPort);
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await translator.translate("self-hosted monitoring");
+
+    expect(consoleWarn).toHaveBeenCalledTimes(1);
+    expect(consoleWarn.mock.calls[0][0]).toContain("401 Incorrect API key provided");
+    consoleWarn.mockRestore();
+  });
+
   it("falls back to the raw query when the response isn't valid JSON", async () => {
     const llmPort = makeMockLlmPort("not json at all");
     const translator = new QueryTranslator(llmPort);

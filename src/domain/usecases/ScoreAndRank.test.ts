@@ -193,6 +193,32 @@ describe("ScoreAndRank.execute", () => {
     expect(consoleError).toHaveBeenCalled();
     consoleError.mockRestore();
   });
+
+  it("reports a persistence failure once for the batch, without the raw error body", async () => {
+    const port = makeMockIntelligencePort();
+    const prismaOffline = new Error(
+      "\nInvalid `this.prisma.repoSnapshot.create()` invocation in\n/app/PrismaAdapter.ts:131:36\n\nCan't reach database server at `localhost:5432`"
+    );
+    prismaOffline.name = "PrismaClientInitializationError";
+    (port.saveSnapshot as ReturnType<typeof vi.fn>).mockRejectedValue(prismaOffline);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const scoreAndRank = new ScoreAndRank(port);
+    const { ranked } = await scoreAndRank.execute(
+      [makeEnriched(), makeEnriched(), makeEnriched()],
+      classification,
+      intent
+    );
+
+    expect(ranked.length).toBeGreaterThan(1);
+    expect(consoleError).toHaveBeenCalledTimes(1);
+
+    const logged = consoleError.mock.calls[0].join(" ");
+    expect(logged).toContain(`${ranked.length} repo(s)`);
+    expect(logged).toContain("database offline");
+    expect(logged).not.toContain("prisma.repoSnapshot.create");
+    consoleError.mockRestore();
+  });
 });
 
 describe("ScoreAndRank ranking weight conservation", () => {

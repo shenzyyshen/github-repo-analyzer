@@ -355,6 +355,20 @@ export type ScoreAndRankResult = {
 };
 
 /**
+ * Condenses a persistence error into one short clause. Prisma's errors carry
+ * a multi-line body with an inlined source excerpt and a node_modules stack;
+ * printing that raw drowned the shortlist whenever Postgres was down.
+ */
+function persistenceFailureReason(err: unknown): string {
+  if (err instanceof Error) {
+    if (err.name === "PrismaClientInitializationError") return "database offline";
+    const firstLine = err.message.split("\n").map((line) => line.trim()).find(Boolean);
+    if (firstLine) return firstLine;
+  }
+  return "unknown error";
+}
+
+/**
  * Use case: Stage 3-4 of the staged search pipeline — score each
  * quality-gated candidate against the prompt, compute health/freshness/
  * decay/dependency signals, combine into a domain-speed-weighted composite
@@ -456,12 +470,22 @@ export class ScoreAndRank {
 
     ranked.sort((a, b) => b.finalScore - a.finalScore);
 
-    await Promise.all(ranked.map((result) => this.persistIntelligence(result)));
+    const persistFailures = (await Promise.all(ranked.map((result) => this.persistIntelligence(result))))
+      .filter((reason): reason is string => reason !== null);
+
+    if (persistFailures.length > 0) {
+      // One line for the whole batch, not one per repo: when the DB is down
+      // every repo fails identically, and N copies of the same error buried
+      // the search results the user is actually waiting on.
+      console.error(
+        `Intelligence data not saved for ${persistFailures.length} repo(s) — ${persistFailures[0]}.`
+      );
+    }
 
     return { promptFitPassedCount: promptFitPassed.length, ranked };
   }
 
-  private async persistIntelligence(result: RankedRepo): Promise<void> {
+  private async persistIntelligence(result: RankedRepo): Promise<string | null> {
     try {
       await Promise.all([
         this.repoIntelligencePort.saveSnapshot({
@@ -484,10 +508,11 @@ export class ScoreAndRank {
           ownerQuality: result.breakdown.health.ownerQuality,
         }),
       ]);
+      return null;
     } catch (err) {
       // Snapshot/health persistence is telemetry for future decay/trend detection —
       // a write failure must never break the search results the user is waiting on.
-      console.error(`Failed to persist intelligence data for ${result.repo.fullName}:`, err);
+      return persistenceFailureReason(err);
     }
   }
 }

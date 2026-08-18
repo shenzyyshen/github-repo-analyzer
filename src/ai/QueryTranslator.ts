@@ -11,6 +11,21 @@ const TranslationSchema = z.object({
 
 export type QueryTranslation = z.infer<typeof TranslationSchema>;
 
+/**
+ * Condenses a translation failure into one short clause. A dead API key, a
+ * network blip, and a schema mismatch all used to print the same useless
+ * "unavailable" line, which meant diagnosing a real outage required
+ * reproducing the LLM call by hand instead of reading the warning.
+ */
+function translationFailureReason(err: unknown): string {
+  if (err instanceof z.ZodError) return "response did not match expected schema";
+  if (err instanceof Error) {
+    const firstLine = err.message.split("\n").map((line) => line.trim()).find(Boolean);
+    if (firstLine) return firstLine.length > 200 ? `${firstLine.slice(0, 200)}…` : firstLine;
+  }
+  return "unknown error";
+}
+
 export class QueryTranslator {
   constructor(private readonly llmPort: LlmPort) {}
 
@@ -33,8 +48,8 @@ export class QueryTranslator {
       const text = await this.llmPort.generateText(prompt);
       const json = this.extractJson(text);
       return TranslationSchema.parse(json);
-    } catch (_err) {
-      console.warn("AI translation unavailable, using raw query");
+    } catch (err) {
+      console.warn(`AI translation unavailable (${translationFailureReason(err)}), using raw query`);
       return {
         query: userQuery,
         language: null,
