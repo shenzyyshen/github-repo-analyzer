@@ -12,7 +12,8 @@
     "cli": "tsx src/cli/index.ts",
     "agent": "tsx src/cli/agent.ts",
     "repo": "tsx src/cli/agent.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "vitest run"
   },
   "engines": {
     "node": ">=20"
@@ -35,6 +36,7 @@
     "@types/node": "^22.0.0",
     "prisma": "^5.0.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.10"
   }
 }

@@ -1,3 +1,6 @@
+> **Superseded.** This is the original MVP design doc (2 ports, pre-staged-pipeline). It is kept for history.
+> The current architecture lives in `ARCHITECTURE.md` at the repo root.
+
 
 # ARCHITECTURE.md — GitHub Repo Analyzer
 ## Ports & Adapters (Hexagonal) Architecture

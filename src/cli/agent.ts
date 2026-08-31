@@ -1,22 +1,28 @@
 #!/usr/bin/env node
 import "dotenv/config";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { execSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import chalk from "chalk";
-import OpenAI from "openai";
 import { PrismaClient } from "@prisma/client";
 import { GithubAdapter } from "../adapters/github/GithubAdapter.js";
 import { PrismaAdapter } from "../adapters/database/PrismaAdapter.js";
+import { FileSessionStore } from "../adapters/session/FileSessionStore.js";
+import { MarkdownReportWriter } from "../adapters/reports/MarkdownReportWriter.js";
+import { OpenAiAdapter } from "../adapters/llm/OpenAiAdapter.js";
 import { AnalyzeRepo } from "../domain/usecases/AnalyzeRepo.js";
+import { AnalyzeRepoDeep } from "../domain/usecases/AnalyzeRepoDeep.js";
 import type { Metrics } from "../domain/entities/Metrics.js";
 import type { SearchResult } from "../domain/entities/SearchResult.js";
+import type { SeenRepoEntry, ShortlistHistoryEntry } from "../domain/entities/SessionState.js";
 import type { RepoReleaseInfo, RepoRootEntry } from "../ports/RepoApiPort.js";
+import type { ReportWriterPort } from "../ports/ReportWriterPort.js";
+import type { LlmPort } from "../ports/LlmPort.js";
 import {
   buildRetrievalQueries,
   buildClarificationPrompt,
   createSessionPreferences,
+  generateClarifyingQuestions as ruleBasedClarifyingQuestions,
   inferFilters,
   normalizeSearchQuery,
   type ClarifyingQuestion,
@@ -24,39 +30,16 @@ import {
   renderAppliedFilters,
   shouldClarifyBeforeSearch,
   type SessionPreferences,
-} from "./intent.js";
-import { runStagedSearch, type RankedRepo, type StagedSearchResult } from "./stagedSearch.js";
+} from "../domain/usecases/ParseIntent.js";
+import { buildSeenEntries, renderSeenRepos, renderShortlistHistory } from "../domain/usecases/ManageSession.js";
+import type { RankedRepo } from "../domain/usecases/ScoreAndRank.js";
+import { runStagedSearch, type StagedSearchResult } from "./stagedSearch.js";
 
 type Role = "user" | "assistant";
 
 type Turn = {
   role: Role;
   content: string;
-};
-
-type RepoContext = {
-  repo: SearchResult;
-  metrics: Metrics;
-  repoData: {
-    fullName: string;
-    description: string | null;
-    defaultBranch: string;
-    forks: number;
-    openIssues: number;
-    createdAt: Date;
-    pushedAt: Date;
-  };
-  languages: Record<string, number>;
-  contributors: number;
-  verifiedOpenIssues: number;
-  readme: string | null;
-  rootContents: RepoRootEntry[];
-  latestRelease: RepoReleaseInfo | null;
-};
-
-type ScoutSelectionContext = {
-  whyRecommended: string;
-  score: number | null;
 };
 
 type SearchPlan = {
@@ -94,22 +77,6 @@ type RankedShortlistItem = {
   fitType: "direct match" | "production choice" | "adaptable framework" | "niche option" | "balanced option";
 };
 
-type SeenRepoEntry = {
-  prompt: string;
-  fullName: string;
-  url: string;
-};
-
-type ShortlistHistoryEntry = {
-  prompt: string;
-  repos: SeenRepoEntry[];
-};
-
-type SessionState = {
-  seenRepos: SeenRepoEntry[];
-  shortlistHistory: ShortlistHistoryEntry[];
-};
-
 type SelectionChoice =
   | { kind: "pick"; index: number }
   | { kind: "none" }
@@ -126,7 +93,6 @@ type TextChoice =
   | { kind: "exit" };
 
 const INVALID_SELECTION_MESSAGE = "Enter a number, or type 're run', 'new', 'none', 'seen', 'history', or 'quit'.";
-const SESSION_FILE = ".codex/session.json";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -262,43 +228,6 @@ function buildRiskSummary(item: AnalyzedRepo): string | null {
   return null;
 }
 
-function buildRiskDetails(context: RepoContext): string[] {
-  const risks: string[] = [];
-  const ageDays = Math.floor((Date.now() - context.metrics.lastCommit.getTime()) / (24 * 60 * 60 * 1000));
-  const issuePressure = context.verifiedOpenIssues / Math.max(context.metrics.stars, 1);
-  const rootNames = new Set(context.rootContents.map((entry) => entry.name.toLowerCase()));
-  const setupSignals =
-    Number(rootNames.has("dockerfile")) +
-    Number(rootNames.has("docker-compose.yml") || rootNames.has("docker-compose.yaml")) +
-    Number(rootNames.has(".env.example")) +
-    Number(rootNames.has("package.json") || rootNames.has("pyproject.toml") || rootNames.has("requirements.txt")) +
-    Number([...rootNames].some((name) => name.startsWith(".github")));
-
-  if (issuePressure > 0.35 && context.contributors < 5) {
-    risks.push("Issue pressure looks high relative to the repo's size and contributor depth.");
-  } else if (issuePressure > 0.1 && context.contributors < 3) {
-    risks.push("Issue pressure is non-trivial and maintainer depth is limited.");
-  }
-
-  if (ageDays > 180) {
-    risks.push("Recent maintenance activity is weak.");
-  }
-
-  if (!context.latestRelease) {
-    risks.push("No GitHub release signal is present.");
-  }
-
-  if (context.contributors <= 1) {
-    risks.push("Contributor depth is shallow, which increases bus-factor risk.");
-  }
-
-  if (setupSignals <= 1) {
-    risks.push("Setup and operational signals are limited from the root snapshot.");
-  }
-
-  return risks;
-}
-
 function buildShortlistNames(results: Array<AnalyzedRepo | RankedShortlistItem>): string {
   const unwrap = (entry: AnalyzedRepo | RankedShortlistItem) => ("item" in entry ? entry.item : entry);
   const successful = results
@@ -318,59 +247,11 @@ function buildShortlistNames(results: Array<AnalyzedRepo | RankedShortlistItem>)
     .join(", ");
 }
 
-function buildSeenEntries(prompt: string, shortlist: RankedShortlistItem[]): SeenRepoEntry[] {
-  return shortlist.map((ranked) => ({
-    prompt,
-    fullName: ranked.item.search.fullName,
-    url: buildRepoUrl(ranked.item.search.fullName),
-  }));
-}
-
-function renderSeenRepos(entries: SeenRepoEntry[]): string {
-  if (entries.length === 0) {
-    return "No repos have been shown in this session yet.\n";
-  }
-
-  return [
-    "Seen repos:",
-    ...entries.map((entry, index) => `${index + 1}. ${entry.prompt}\n   ${entry.fullName}\n   ${entry.url}`),
-    "",
-  ].join("\n");
-}
-
-function renderShortlistHistory(entries: ShortlistHistoryEntry[]): string {
-  if (entries.length === 0) {
-    return "No shortlist history is available yet.\n";
-  }
-
-  return [
-    "Shortlist history:",
-    ...entries.map((entry, index) => `${index + 1}. ${entry.prompt}\n   ${entry.repos.map((repo) => repo.fullName).join(", ")}`),
-    "",
-  ].join("\n");
-}
-
-async function loadSessionState(): Promise<SessionState> {
-  try {
-    const raw = await readFile(SESSION_FILE, "utf8");
-    const parsed = JSON.parse(raw) as Partial<SessionState>;
-    return {
-      seenRepos: Array.isArray(parsed.seenRepos) ? parsed.seenRepos : [],
-      shortlistHistory: Array.isArray(parsed.shortlistHistory) ? parsed.shortlistHistory : [],
-    };
-  } catch {
-    return { seenRepos: [], shortlistHistory: [] };
-  }
-}
-
-async function saveSessionState(state: SessionState): Promise<void> {
-  await mkdir(".codex", { recursive: true });
-  await writeFile(SESSION_FILE, JSON.stringify(state, null, 2), "utf8");
-}
-
-async function writeScoutReport(results: RankedShortlistItem[], summary: string): Promise<void> {
-  await mkdir("reports", { recursive: true });
-
+async function writeScoutReport(
+  reportWriterPort: ReportWriterPort,
+  results: RankedShortlistItem[],
+  summary: string
+): Promise<void> {
   const timestamp = new Date().toISOString();
   const header = `# Repo Scout Results\n\nGenerated: ${timestamp}\n`;
   const tableHeader = [
@@ -402,7 +283,7 @@ async function writeScoutReport(results: RankedShortlistItem[], summary: string)
     "",
   ].join("\n");
 
-  await writeFile("reports/REPO_SCOUT_RESULTS.md", content, "utf8");
+  await reportWriterPort.writeScoutReport(content);
 }
 
 // ---------------------------------------------------------------------------
@@ -595,272 +476,8 @@ async function promptAfterAnalysis(
   }
 }
 
-async function buildRepoContext(
-  githubAdapter: GithubAdapter,
-  analyzeRepo: AnalyzeRepo,
-  repo: SearchResult
-): Promise<RepoContext> {
-  const [metrics, repoData, languages, contributors, verifiedOpenIssues, readme, rootContents, latestRelease] = await Promise.all([
-    analyzeRepo.execute(repo.owner, repo.name, true),
-    githubAdapter.getRepo(repo.owner, repo.name),
-    githubAdapter.getLanguages(repo.owner, repo.name),
-    githubAdapter.getContributors(repo.owner, repo.name),
-    githubAdapter.getIssues(repo.owner, repo.name),
-    githubAdapter.getReadme(repo.owner, repo.name),
-    githubAdapter.getRootContents(repo.owner, repo.name),
-    githubAdapter.getLatestRelease(repo.owner, repo.name),
-  ]);
-
-  return {
-    repo,
-    metrics,
-    repoData: {
-      fullName: repoData.fullName,
-      description: repoData.description,
-      defaultBranch: repoData.defaultBranch,
-      forks: repoData.forks,
-      openIssues: repoData.openIssues,
-      createdAt: repoData.createdAt,
-      pushedAt: repoData.pushedAt,
-    },
-    languages,
-    contributors,
-    verifiedOpenIssues,
-    readme,
-    rootContents,
-    latestRelease,
-  };
-}
-
-function detectStackSignals(rootContents: RepoRootEntry[], readme: string | null): string[] {
-  const names = new Set(rootContents.map((entry) => entry.name.toLowerCase()));
-  const readmeText = readme?.toLowerCase() ?? "";
-  const signals: string[] = [];
-
-  if (names.has("package.json")) signals.push("Node.js / JavaScript or TypeScript");
-  if (names.has("tsconfig.json")) signals.push("TypeScript");
-  if (names.has("pyproject.toml") || names.has("requirements.txt")) signals.push("Python");
-  if (names.has("go.mod")) signals.push("Go");
-  if (names.has("cargo.toml")) signals.push("Rust");
-  if (names.has("dockerfile")) signals.push("Docker");
-  if (names.has("docker-compose.yml") || names.has("docker-compose.yaml")) signals.push("Docker Compose");
-  if (names.has(".env.example")) signals.push("environment-template provided");
-  if ([...names].some((name) => name.startsWith(".github"))) signals.push("GitHub Actions / CI config");
-  if (readmeText.includes("typescript") && !signals.includes("TypeScript")) signals.push("TypeScript");
-  if (readmeText.includes("python") && !signals.includes("Python")) signals.push("Python");
-
-  return [...new Set(signals)];
-}
-
-function buildStructureOverview(rootContents: RepoRootEntry[]): string[] {
-  const names = rootContents.map((entry) => entry.name).sort((a, b) => a.localeCompare(b));
-  return names.slice(0, 15);
-}
-
-function detectSetupSignals(rootContents: RepoRootEntry[], readme: string | null): string[] {
-  const names = new Set(rootContents.map((entry) => entry.name.toLowerCase()));
-  const signals: string[] = [];
-
-  if (readme && readme.length > 300) signals.push("README has meaningful setup/documentation content");
-  if (names.has("dockerfile")) signals.push("Docker setup present");
-  if (names.has("docker-compose.yml") || names.has("docker-compose.yaml")) signals.push("docker-compose present");
-  if (names.has("makefile")) signals.push("Makefile present");
-  if (names.has(".env.example")) signals.push(".env.example present");
-  if ([...names].some((name) => name.startsWith(".github"))) signals.push("CI/workflow config present");
-
-  return signals;
-}
-
-async function loadScoutSelectionContext(
-  repoFullName: string
-): Promise<ScoutSelectionContext | null> {
-  try {
-    const content = await readFile("reports/REPO_SCOUT_RESULTS.md", "utf8");
-    const lines = content.split("\n");
-
-    for (const line of lines) {
-      if (!line.startsWith("|")) continue;
-      if (line.includes("Repo | Score | Best For")) continue;
-      if (line.includes("---")) continue;
-
-      const columns = line
-        .split("|")
-        .slice(1, -1)
-        .map((part) => part.trim());
-
-      if (columns.length < 8) continue;
-      if (columns[0] !== repoFullName) continue;
-
-      const score = Number(columns[1]);
-      return {
-        whyRecommended: columns[3],
-        score: Number.isNaN(score) ? null : score,
-      };
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function writeAnalysisReport(context: RepoContext): Promise<void> {
-  await mkdir("reports", { recursive: true });
-  const scoutContext = await loadScoutSelectionContext(context.repoData.fullName);
-
-  const languageLines = Object.entries(context.languages)
-    .sort((a, b) => b[1] - a[1])
-    .map(([name, bytes]) => `- ${name}: ${bytes.toLocaleString()}`)
-    .join("\n");
-  const stackSignals = detectStackSignals(context.rootContents, context.readme);
-  const structureOverview = buildStructureOverview(context.rootContents);
-  const setupSignals = detectSetupSignals(context.rootContents, context.readme);
-  const readmeSnippet = context.readme
-    ? context.readme
-        .replace(/\r/g, "")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .slice(0, 6)
-        .join(" ")
-        .slice(0, 500)
-    : null;
-  const latestReleaseLine = context.latestRelease
-    ? `- Latest Release: ${context.latestRelease.tagName} (${context.latestRelease.publishedAt.toISOString()})`
-    : "- Latest Release: none detected";
-  const riskDetails = buildRiskDetails(context);
-  const repoUrl = buildRepoUrl(context.repoData.fullName);
-  const analysisHeadline = scoutContext
-    ? `${context.repoData.fullName} was shortlisted because the scout identified it as a strong candidate for this request, with particular emphasis on: ${scoutContext.whyRecommended}.`
-    : `${context.repoData.fullName} was analyzed as a candidate repository based on its GitHub metadata, structure signals, and README content.`;
-  const firstImpression = [
-    context.repoData.description ?? null,
-    stackSignals.length > 0 ? `Likely stack: ${stackSignals.join(", ")}.` : null,
-    setupSignals.length > 0 ? `Setup quality signals: ${setupSignals.slice(0, 3).join(", ")}.` : null,
-    context.latestRelease ? `A GitHub release exists (${context.latestRelease.tagName}), which is a useful maturity signal.` : "No GitHub release was detected from the current snapshot.",
-  ]
-    .filter(Boolean)
-    .join(" ");
-  const selectionReasons = scoutContext
-    ? [
-        `- Scout score: ${scoutContext.score !== null ? `${scoutContext.score}/10` : "not available"}`,
-        `- Scout rationale: ${scoutContext.whyRecommended}`,
-        `- Current repo description: ${context.repoData.description ?? "No description provided"}`,
-        `- README support: ${readmeSnippet ?? "README unavailable"}`,
-      ].join("\n")
-    : null;
-
-  const selectedSection = scoutContext
-    ? [
-        "## Why This Repo Was Selected",
-        "",
-        selectionReasons,
-        "",
-      ]
-        .filter(Boolean)
-        .join("\n")
-    : "";
-
-  const concernsSection =
-    scoutContext && scoutContext.score !== null && scoutContext.score < 7
-      ? [
-          "## Scout Concerns",
-          "",
-          `The scout scored this repo ${scoutContext.score}/10, so review it with extra attention to the trade-offs implied by: ${scoutContext.whyRecommended}.`,
-          "",
-        ].join("\n")
-      : "";
-
-  const focusSection = scoutContext
-    ? [
-        "## Analysis Focus",
-        "",
-        `This analysis emphasizes the areas highlighted by the scout: ${scoutContext.whyRecommended}.`,
-        "",
-      ].join("\n")
-    : "";
-
-  const content = [
-    "# Repo Analysis",
-    "",
-    `Generated: ${new Date().toISOString()}`,
-    "",
-    "## Analysis Summary",
-    "",
-    analysisHeadline,
-    "",
-    "## First Impression",
-    "",
-    firstImpression,
-    "",
-    selectedSection,
-    concernsSection,
-    focusSection,
-    "## Project Summary",
-    "",
-    `${context.repoData.fullName} is a ${context.repo.language ?? "software"} repository with ${context.metrics.stars.toLocaleString()} stars and ${context.contributors.toLocaleString()} contributors.`,
-    context.repoData.description ?? "No description provided.",
-    "",
-    "## Tech Stack Signals",
-    "",
-    ...(stackSignals.length > 0 ? stackSignals.map((signal) => `- ${signal}`) : ["- No strong stack signal detected from root files"]),
-    "",
-    "## Structure Overview",
-    "",
-    ...(structureOverview.length > 0 ? structureOverview.map((entry) => `- ${entry}`) : ["- Root contents unavailable"]),
-    "",
-    "## Setup Quality Signals",
-    "",
-    ...(setupSignals.length > 0 ? setupSignals.map((signal) => `- ${signal}`) : ["- No obvious setup-quality signals detected"]),
-    "",
-    "## Risks",
-    "",
-    ...(riskDetails.length > 0 ? riskDetails.map((risk) => `- ${risk}`) : ["- No major structural or maintenance risk stood out from the current snapshot."]),
-    "",
-    "## README Snapshot",
-    "",
-    readmeSnippet ?? "README unavailable.",
-    "",
-    "## Repository Metadata",
-    "",
-    `- Repo: ${context.repoData.fullName}`,
-    `- GitHub URL: ${repoUrl}`,
-    `- Default Branch: ${context.repoData.defaultBranch}`,
-    `- Created At: ${context.repoData.createdAt.toISOString()}`,
-    `- Last Push: ${context.repoData.pushedAt.toISOString()}`,
-    `- Forks: ${context.repoData.forks.toLocaleString()}`,
-    latestReleaseLine,
-    "",
-    "## Metrics Snapshot",
-    "",
-    `- Stars: ${context.metrics.stars.toLocaleString()}`,
-    `- 24h Growth: ${context.metrics.starGrowth24h}`,
-    `- Open Issues: ${context.verifiedOpenIssues.toLocaleString()}`,
-    `- Contributors: ${context.contributors.toLocaleString()}`,
-    `- Last Commit: ${context.metrics.lastCommit.toISOString()}`,
-    "",
-    "## Language Breakdown",
-    "",
-    languageLines || "- No language data available",
-    "",
-  ].join("\n");
-
-  await writeFile("reports/REPO_ANALYSIS.md", content, "utf8");
-}
-
 class AiBrain {
-  private readonly openaiClient: OpenAI | null;
-  private readonly openaiModel: string;
-  private readonly claudeKey: string | null;
-  private readonly claudeModel: string;
-
-  constructor() {
-    const openaiKey = process.env.OPENAI_API_KEY ?? null;
-    this.openaiClient = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null;
-    this.openaiModel = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
-    this.claudeKey = process.env.CLAUDE_API_KEY ?? null;
-    this.claudeModel = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-20250514";
-  }
+  constructor(private readonly llmPort: LlmPort) {}
 
   async plan(history: Turn[], userInput: string): Promise<SearchPlan> {
     const historyText = history
@@ -888,7 +505,7 @@ class AiBrain {
     ].join("\n");
 
     try {
-      const raw = await this.generateText(prompt);
+      const raw = await this.llmPort.generateText(prompt);
       return this.parsePlan(raw, userInput);
     } catch (_err) {
       return {
@@ -935,7 +552,7 @@ class AiBrain {
     ].join("\n");
 
     try {
-      return await this.generateText(prompt);
+      return await this.llmPort.generateText(prompt);
     } catch (_err) {
       if (results.length === 0) {
         return "I did not find a strong match for that query. Do you want to narrow by framework, stars, or recency?";
@@ -951,6 +568,7 @@ class AiBrain {
   }
 
   async generateClarifyingQuestions(
+    intent: ParsedIntent,
     userInput: string,
     prefs: SessionPreferences
   ): Promise<ClarifyingQuestion[]> {
@@ -970,7 +588,7 @@ class AiBrain {
     ].join("\n");
 
     try {
-      const raw = await this.generateText(prompt);
+      const raw = await this.llmPort.generateText(prompt);
       const start = raw.indexOf("[");
       const end = raw.lastIndexOf("]");
       if (start === -1 || end === -1) throw new Error("No JSON array found");
@@ -979,54 +597,14 @@ class AiBrain {
         .filter((q) => q.key && q.text && !prefs.skipped.has(q.key))
         .slice(0, 4);
     } catch {
-      return [];
+      // LLM unavailable or returned junk — fall back to the rule-based
+      // generator instead of asking nothing. Every other LLM call site in
+      // this file degrades to a non-AI fallback on failure (plan(),
+      // QueryTranslator.translate()); this one silently returned [] until
+      // now, which meant a flaky LLM call skipped clarification entirely
+      // rather than degrading it.
+      return ruleBasedClarifyingQuestions(intent, userInput, prefs);
     }
-  }
-
-  private async generateText(prompt: string): Promise<string> {
-    if (this.claudeKey) {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": this.claudeKey,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model: this.claudeModel,
-          max_tokens: 800,
-          messages: [{ role: "user", content: prompt }],
-        }),
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Claude request failed: ${response.status} ${text}`);
-      }
-
-      const data = (await response.json()) as {
-        content?: Array<{ type: string; text?: string }>;
-      };
-      const text = data.content?.find((item) => item.type === "text")?.text?.trim();
-      if (!text) {
-        throw new Error("Claude response did not include text content");
-      }
-      return text;
-    }
-
-    if (this.openaiClient) {
-      const response = await this.openaiClient.responses.create({
-        model: this.openaiModel,
-        input: prompt,
-      });
-      const text = response.output_text?.trim();
-      if (!text) {
-        throw new Error("OpenAI response did not include text output");
-      }
-      return text;
-    }
-
-    throw new Error("Missing CLAUDE_API_KEY or OPENAI_API_KEY");
   }
 
   private parsePlan(raw: string, userInput: string): SearchPlan {
@@ -1067,10 +645,19 @@ async function main() {
   const prisma = new PrismaClient();
   const githubAdapter = new GithubAdapter(requireEnv("GITHUB_TOKEN"));
   const prismaAdapter = new PrismaAdapter(prisma);
-  const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter);
-  const brain = new AiBrain();
+  const analyzeRepo = new AnalyzeRepo(githubAdapter, prismaAdapter, prismaAdapter);
+  const sessionStore = new FileSessionStore();
+  const reportWriter = new MarkdownReportWriter();
+  const analyzeRepoDeep = new AnalyzeRepoDeep(githubAdapter, analyzeRepo, reportWriter);
+  const llmPort = new OpenAiAdapter({
+    openaiApiKey: process.env.OPENAI_API_KEY ?? null,
+    openaiModel: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+    claudeApiKey: process.env.CLAUDE_API_KEY ?? null,
+    claudeModel: process.env.CLAUDE_MODEL ?? "claude-sonnet-4-20250514",
+  });
+  const brain = new AiBrain(llmPort);
   const rl = createInterface({ input, output });
-  const persistedSession = await loadSessionState();
+  const persistedSession = await sessionStore.load();
   const history: Turn[] = [];
   const rejectedRepos = new Set<string>();
   const seenRepos: SeenRepoEntry[] = [...persistedSession.seenRepos];
@@ -1124,7 +711,7 @@ async function main() {
       const { intent } = inferred;
 
       // Ask clarifying questions — LLM generates questions specific to this query
-      const questions = await brain.generateClarifyingQuestions(userInput, sessionPrefs);
+      const questions = await brain.generateClarifyingQuestions(intent, userInput, sessionPrefs);
       if (questions.length > 0) {
         output.write(chalk.cyan.bold("\nA few questions to sharpen the search:\n\n"));
         for (let qi = 0; qi < questions.length; qi++) {
@@ -1236,11 +823,14 @@ async function main() {
       }
       output.write(`${response}\n`);
       history.push({ role: "assistant", content: response });
-      const shortlistEntries = buildSeenEntries(userInput, shortlist);
+      const shortlistEntries = buildSeenEntries(
+        userInput,
+        shortlist.map((ranked) => ranked.item.search.fullName)
+      );
       seenRepos.push(...shortlistEntries);
       shortlistHistory.push({ prompt: userInput, repos: shortlistEntries });
-      await saveSessionState({ seenRepos, shortlistHistory });
-      await writeScoutReport(shortlist, response);
+      await sessionStore.save({ seenRepos, shortlistHistory });
+      await writeScoutReport(reportWriter, shortlist, response);
       output.write(`${renderShortlist(shortlist)}\n`);
 
       shortlist: while (true) {
@@ -1360,8 +950,7 @@ async function main() {
         }
 
         output.write(`Running in-depth analysis for ${chosen.fullName}...\n`);
-        const repoContext = await buildRepoContext(githubAdapter, analyzeRepo, chosen);
-        await writeAnalysisReport(repoContext);
+        await analyzeRepoDeep.execute(chosen);
         output.write("Report saved to ./reports/REPO_ANALYSIS.md\n");
 
         while (true) {

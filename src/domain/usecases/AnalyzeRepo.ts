@@ -1,6 +1,7 @@
 import type { Metrics } from "../entities/Metrics.js";
 import type { RepoApiPort } from "../../ports/RepoApiPort.js";
 import type { MetricsRepoPort } from "../../ports/MetricsRepoPort.js";
+import type { RepoIntelligencePort } from "../../ports/RepoIntelligencePort.js";
 
 /**
  * Use case: analyze a GitHub repo and persist metrics.
@@ -9,7 +10,8 @@ import type { MetricsRepoPort } from "../../ports/MetricsRepoPort.js";
 export class AnalyzeRepo {
   constructor(
     private readonly repoApiPort: RepoApiPort,
-    private readonly metricsRepoPort: MetricsRepoPort
+    private readonly metricsRepoPort: MetricsRepoPort,
+    private readonly repoIntelligencePort: RepoIntelligencePort
   ) {}
 
   /**
@@ -57,6 +59,27 @@ export class AnalyzeRepo {
     };
 
     await this.metricsRepoPort.saveMetrics(metrics);
+
+    // Best-effort — this is telemetry for future decay/trend detection, not
+    // core to what the caller asked for, so a write failure here must never
+    // fail the analysis itself. Same pattern as ScoreAndRank's snapshot
+    // writes. Release fields are left null: this call path doesn't fetch
+    // latest-release data (only the staged-search pipeline does), and
+    // guessing would be worse than an honest gap.
+    try {
+      await this.repoIntelligencePort.saveSnapshot({
+        fullName: repoData.fullName,
+        stars: repoData.stars,
+        forks: repoData.forks,
+        openIssues,
+        pushedAt: repoData.pushedAt,
+        releasedAt: null,
+        releaseTag: null,
+      });
+    } catch (err) {
+      console.error(`Failed to persist intelligence snapshot for ${repoData.fullName}:`, err);
+    }
+
     return metrics;
   }
 }

@@ -1,5 +1,5 @@
-import OpenAI from "openai";
 import { z } from "zod";
+import type { LlmPort } from "../ports/LlmPort.js";
 
 const TranslationSchema = z.object({
   query: z.string().min(1),
@@ -11,14 +11,23 @@ const TranslationSchema = z.object({
 
 export type QueryTranslation = z.infer<typeof TranslationSchema>;
 
-export class QueryTranslator {
-  private readonly client: OpenAI;
-  private readonly model: string;
-
-  constructor(apiKey: string, model = "gpt-3.5-turbo") {
-    this.client = new OpenAI({ apiKey });
-    this.model = model;
+/**
+ * Condenses a translation failure into one short clause. A dead API key, a
+ * network blip, and a schema mismatch all used to print the same useless
+ * "unavailable" line, which meant diagnosing a real outage required
+ * reproducing the LLM call by hand instead of reading the warning.
+ */
+function translationFailureReason(err: unknown): string {
+  if (err instanceof z.ZodError) return "response did not match expected schema";
+  if (err instanceof Error) {
+    const firstLine = err.message.split("\n").map((line) => line.trim()).find(Boolean);
+    if (firstLine) return firstLine.length > 200 ? `${firstLine.slice(0, 200)}…` : firstLine;
   }
+  return "unknown error";
+}
+
+export class QueryTranslator {
+  constructor(private readonly llmPort: LlmPort) {}
 
   async translate(userQuery: string): Promise<QueryTranslation> {
     const prompt = [
@@ -36,16 +45,11 @@ export class QueryTranslator {
     ].join("\n");
 
     try {
-      const response = await this.client.responses.create({
-        model: this.model,
-        input: prompt,
-      });
-
-      const text = response.output_text?.trim() ?? "";
+      const text = await this.llmPort.generateText(prompt);
       const json = this.extractJson(text);
       return TranslationSchema.parse(json);
-    } catch (_err) {
-      console.warn("AI translation unavailable, using raw query");
+    } catch (err) {
+      console.warn(`AI translation unavailable (${translationFailureReason(err)}), using raw query`);
       return {
         query: userQuery,
         language: null,

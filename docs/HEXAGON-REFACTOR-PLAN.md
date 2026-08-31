@@ -1,6 +1,15 @@
 # Hexagon Refactor Plan — reconciling the current codebase with action-plan-v2
 
-Status: proposal, not yet implemented. Written 2026-07-27.
+Status: **complete** as of 2026-08-01. Written 2026-07-27.
+
+All six use cases and all three new ports described below were extracted, each
+in its own commit with tests, on branch `refactor/hexagon-cleanup`. `ARCHITECTURE.md`
+now describes the resulting structure and is the current source of truth; this
+document is kept as the record of what was planned and why.
+
+One item was never scoped in and remains open: `classifyIntent` /
+`inferArtifactType` still live in `src/cli/stagedSearch.ts` rather than
+`ParseIntent`. See `KNOWN_ISSUES.md`.
 
 ## Why this document exists
 

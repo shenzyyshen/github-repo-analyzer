@@ -20,13 +20,14 @@ Example prompt:
 - **Shortlist ranking with rationale**: rank repos by prompt fit, adoption, maturity, maintenance, setup signals, release signals, and quality-floor filters
 - **Decision-ready shortlist output**: each candidate includes best use case, rationale, tradeoff, caution, stars, forks, contributors, age, language, and GitHub link
 - **Risk-aware repo curation**: evaluate issue pressure, maintenance risk, release risk, adoption risk, and setup risk
-- **Category extraction**: infer whether a repo is a service, framework, SDK, plugin, CLI, server, workflow, library, or desktop app
+- **Artifact-type inference**: classify a repo as a library, framework, CLI, tips-content, dataset, boilerplate, or general tool, and score how well that matches what you asked for
 - **Deep repo analysis**: select a repo from the shortlist and generate a richer markdown report in `reports/REPO_ANALYSIS.md`
 - **Saved scout report**: each shortlist run writes `reports/REPO_SCOUT_RESULTS.md`
 - **Session recall**: `seen`, `history`, and `.codex/session.json` preserve earlier shortlists and repo links across restarts
+- **Staged pipeline with visible funnel**: every search reports `raw → quality → fit → ranked → returned` counts, so an over-filtered or thin pool is visible rather than silent
 - **CLI fallback behavior**: if AI query translation is unavailable, the tool falls back to raw GitHub search instead of failing
-- **REST API + MCP support**: same core capabilities can be exposed to programmatic clients and AI tooling
-- **Hexagonal architecture**: domain logic stays isolated from GitHub, database, and transport adapters
+- **REST API + MCP**: single-repo analysis and trending are exposed over HTTP and MCP (see [Scope](#scope) — the discovery pipeline above is CLI-only)
+- **Hexagonal architecture**: domain logic depends only on port interfaces — six ports with swappable adapters for GitHub, PostgreSQL, LLM providers, session state, and report output
 
 ---
 
@@ -105,8 +106,22 @@ Useful in-session commands:
 
 ---
 
+## Scope
+
+This repo contains two related systems at different levels of maturity. Worth knowing which is which:
+
+| | Discovery pipeline | Single-repo lookup |
+|---|---|---|
+| **What** | Natural-language search → retrieval → gates → scoring → ranked shortlist | Analyze one repo's metrics; list trending repos |
+| **Surfaces** | CLI + MCP (`npm run repo`, `npm run cli -- search`, `search_repos` tool) | CLI + REST + MCP |
+| **Use cases** | `SearchRepos` (composing `ParseIntent`, `DiscoverRepos`, `ApplyQualityGates`, `ScoreAndRank`), plus `AnalyzeRepoDeep` | `AnalyzeRepo`, `GetTrending` |
+
+Both run unmodified across their transports via constructor injection in `src/index.ts` — the CLI adds terminal rendering, MCP adds JSON payload shaping, neither touches the pipeline itself. The discovery pipeline has no HTTP surface yet.
+
+---
+
 ## REST API
-These endpoints are stable and intended for a future GUI:
+Single-repo analysis and trending over HTTP. Stable, intended for a future GUI:
 
 - `GET /health`
 - `POST /repos/:owner/:repo/analyze` (body: `{ "deep": false }`)
@@ -116,9 +131,30 @@ These endpoints are stable and intended for a future GUI:
 ---
 
 ## MCP Tools
-Exposes the same functionality to MCP-compatible AI clients:
-- `analyze_repo(owner, repo, deep?)`
-- `get_trending(language?)`
+Exposed to MCP-compatible AI clients (Claude Desktop, etc.) over stdio:
+
+- **`search_repos(query, language?, minStars?, since?, mode?, top?)`** — the full discovery pipeline. Give it a plain-English need and it returns a ranked shortlist where each entry carries health score, decay label, owner tier, dependency health, and a one-line rationale for its placement. This is the same `SearchRepos` use case the CLI runs.
+- `analyze_repo(owner, repo, deep?)` — metrics for one named repo
+- `get_trending(language?)` — locally-cached repos by recent star growth
+
+Wire it into Claude Desktop via `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "github-repo-analyzer": {
+      "command": "node",
+      "args": ["/absolute/path/to/repo-metrics-hex/dist/index.js", "--mcp"],
+      "env": {
+        "GITHUB_TOKEN": "ghp_...",
+        "DATABASE_URL": "postgresql://..."
+      }
+    }
+  }
+}
+```
+
+Run `npm run build` first so `dist/` exists.
 
 ---
 
@@ -136,6 +172,12 @@ GITHUB_TOKEN=ghp_...
 OPENAI_API_KEY=sk-...
 DATABASE_URL=postgresql://user:password@localhost:5432/repo_metrics
 PORT=3005
+
+# Optional
+OPENAI_MODEL=gpt-4o-mini
+# If set, the conversational agent prefers Claude over OpenAI
+CLAUDE_API_KEY=sk-ant-...
+CLAUDE_MODEL=claude-sonnet-4-20250514
 ```
 
 ### 3. Start Postgres
@@ -162,41 +204,43 @@ npm run cli -- search "react state management" --language ts --min-stars 1000
 npm run dev
 ```
 
+### Tests
+```bash
+npm test
+```
+
 ---
 
 ## Architecture
-This project uses **Hexagonal (Ports & Adapters)** architecture.
+This project uses **Hexagonal (Ports & Adapters)** architecture. The domain depends only on port interfaces — never on a concrete adapter, HTTP framework, database client, or terminal library.
 
-- `src/domain/` contains core entities and use cases
-- `src/ports/` defines the interfaces the domain depends on
-- `src/adapters/` implements GitHub and database access
-- `src/cli/` contains the direct CLI commands, conversational agent, intent parser, retrieval logic, shortlist ranking, and session recall
-- `src/server/` exposes the same core logic through API and MCP surfaces
+- `src/domain/usecases/` — the pipeline stages and analysis use cases (`ParseIntent`, `DiscoverRepos`, `ApplyQualityGates`, `ScoreAndRank`, `AnalyzeRepoDeep`, `ManageSession`, `AnalyzeRepo`, `GetTrending`)
+- `src/domain/entities/`, `src/domain/shared/` — data shapes and cross-stage pure helpers
+- `src/ports/` — six interfaces: `RepoApiPort`, `MetricsRepoPort`, `RepoIntelligencePort`, `SessionStorePort`, `ReportWriterPort`, `LlmPort`
+- `src/adapters/` — one implementation per port: Octokit, Prisma, file-based session store, markdown report writer, OpenAI/Claude
+- `src/cli/`, `src/server/` — driving adapters (composition roots, prompts, rendering, HTTP/MCP transport)
 
-This keeps the product logic separate from infrastructure details and makes retrieval, ranking, analysis, session recall, and transport layers easier to evolve independently.
+`src/config/thresholds.ts` holds every tunable scoring constant, so ranking behavior can be adjusted without touching logic.
 
-See:
-- `ARCHITECTURE.md`
-- `docs/IMPLEMENTATION-AND-GUI.md`
-- `docs/DECISIONS.md`
+See `ARCHITECTURE.md` for the full picture, including an honest list of known gaps.
 
 ---
 
 ## Roadmap
-**Short-term**
-- Better README/topic-based category understanding
-- Stronger prompt-specific ranking and rationale generation
-- Startup session controls like `clear history` or resume prompts
 
-**Medium-term**
-- Search history and saved results
-- GitHub OAuth and user-linked actions
+See `ARCHITECTURE.md` for the dependency-ordered version and `KNOWN_ISSUES.md` for tracked gaps.
+
+**Next**
+- Run the README-quality calibration spike against real search results — the ranking's core judgment call (does a better-documented, lower-star repo correctly beat a poorly-documented, higher-star one) has no historical fallback now that a standing ingestion job has been ruled out, so validating it directly matters more than it used to.
+
+**Shelved (2026-08-05)** — a background snapshot poller doesn't fit how this tool is actually used (one-off, prompt-driven discovery, not a fixed portfolio to keep re-checking), so decay/dependency signals are evaluated live by design, not as a placeholder:
+- Delta-based decay detection, stars-velocity trends, trend radar, `--trends`, watch targets and notifications
+
+**Independently open**
+- Dependency/supply-chain risk (needs a confirmed data source)
+- Owner profile persistence, plain search-history logging
 - Compare mode for shortlisted repos
-
-**Long-term**
-- Web UI on top of the same API/domain layer
-- Richer analytics and trend tracking
-- Clone-based external repo quality analysis
+- Web UI over the same domain layer
 
 ---
 
